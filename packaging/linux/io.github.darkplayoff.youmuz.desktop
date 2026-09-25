@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=YouMuz
+GenericName=Music Player
+Comment=YouMuz - a Yandex Music client
+Exec=youmuz
+Icon=io.github.darkplayoff.youmuz
+Terminal=false
+Type=Application
+Categories=Audio;Music;Player;
+StartupWMClass=io.github.darkplayoff.youmuz

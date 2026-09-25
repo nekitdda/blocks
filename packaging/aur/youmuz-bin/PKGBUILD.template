@@ -1,0 +1,35 @@
+# Maintainer: Your Name <your.email@example.com>
+pkgname=youmuz-bin
+_pkgname=youmuz
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="YouMuz - a Yandex Music client"
+arch=('x86_64')
+url="https://github.com/@REPO@"
+license=('GPL-3.0-or-later')
+depends=('gtk3' 'libsecret' 'libsoup3' 'webkit2gtk-4.1' 'alsa-lib' 'libayatana-appindicator' 'dbus')
+makedepends=('imagemagick')
+provides=('youmuz')
+conflicts=('youmuz')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/@REPO@/releases/download/v${pkgver}/youmuz-linux-x64-${pkgver}.tar.gz"
+        "LICENSE::https://raw.githubusercontent.com/@REPO@/v${pkgver}/LICENSE"
+        "io.github.darkplayoff.youmuz.desktop::https://raw.githubusercontent.com/@REPO@/v${pkgver}/packaging/linux/io.github.darkplayoff.youmuz.desktop")
+sha256sums=('@TARBALL_SHA_X64@'
+            '@LICENSE_SHA@'
+            '@DESKTOP_SHA@')
+
+package() {
+  install -dm755 "${pkgdir}/opt/${_pkgname}"
+  cp -r "${srcdir}/data" "${srcdir}/lib" "${pkgdir}/opt/${_pkgname}/"
+  install -Dm755 "${srcdir}/${_pkgname}" "${pkgdir}/opt/${_pkgname}/${_pkgname}"
+
+  install -dm755 "${pkgdir}/usr/bin"
+  ln -s "/opt/${_pkgname}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+
+  install -Dm644 "${srcdir}/io.github.darkplayoff.youmuz.desktop" "${pkgdir}/usr/share/applications/io.github.darkplayoff.youmuz.desktop"
+
+  magick "${srcdir}/data/flutter_assets/assets/icons/logo.webp" -resize 256x256 "${srcdir}/icon.png"
+  install -Dm644 "${srcdir}/icon.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/io.github.darkplayoff.youmuz.png"
+
+  install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

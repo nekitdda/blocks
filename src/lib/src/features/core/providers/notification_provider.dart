@@ -1,0 +1,249 @@
+import 'dart:async';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:signals_flutter/signals_flutter.dart';
+
+enum AppNotificationLevel { error, warning, success }
+
+class AppNotification {
+  final String message;
+  final AppNotificationLevel level;
+  final DateTime timestamp;
+
+  AppNotification({
+    required this.message,
+    this.level = AppNotificationLevel.error,
+  }) : timestamp = DateTime.now();
+
+  bool get isError => level == AppNotificationLevel.error;
+}
+
+final FlutterSignal<AppNotification?> appNotificationSignal =
+    signal<AppNotification?>(null);
+
+void showAppError(String message) {
+  var msg = message;
+  final lowerMsg = message.toLowerCase();
+  if (lowerMsg.contains('networkerror') ||
+      lowerMsg.contains('network error') ||
+      lowerMsg.contains('connection error') ||
+      lowerMsg.contains('timed out') ||
+      lowerMsg.contains('timeout')) {
+    msg = 'Отсутствует подключение к сети. Проверьте интернет-соединение.';
+  }
+  appNotificationSignal.value = AppNotification(message: msg);
+}
+
+void showAppWarning(String message) {
+  appNotificationSignal.value = AppNotification(
+    message: message,
+    level: AppNotificationLevel.warning,
+  );
+}
+
+void showAppSuccess(String message) {
+  appNotificationSignal.value = AppNotification(
+    message: message,
+    level: AppNotificationLevel.success,
+  );
+}
+
+class GlobalNotificationListener extends StatefulWidget {
+  final Widget child;
+  const GlobalNotificationListener({required this.child, super.key});
+
+  @override
+  State<GlobalNotificationListener> createState() =>
+      _GlobalNotificationListenerState();
+}
+
+class _GlobalNotificationListenerState extends State<GlobalNotificationListener>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<Offset> _offsetAnimation;
+  late final EffectCleanup _notificationEffect;
+  AppNotification? _currentNotification;
+  DateTime? _lastShown;
+  /// Notifications that arrived while one was on screen.
+  ///
+  /// They used to be dropped outright (`if (_controller.isAnimating) return;`),
+  /// and since `_lastShown` was already stamped there was no retry either — so
+  /// two errors inside the 4s dwell window meant the second was never shown.
+  final Queue<AppNotification> _pending = Queue();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 600),
+      vsync: this,
+    );
+    _offsetAnimation =
+        Tween<Offset>(
+          begin: const Offset(0, -2),
+          end: Offset.zero,
+        ).animate(
+          CurvedAnimation(
+            parent: _controller,
+            curve: Curves.easeOutBack,
+          ),
+        );
+
+    _notificationEffect = effect(() {
+      final notif = appNotificationSignal.value;
+      if (notif == null) return;
+      if (_lastShown != null && notif.timestamp.isBefore(_lastShown!)) return;
+
+      _lastShown = notif.timestamp;
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        unawaited(_showNotification(notif));
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _notificationEffect();
+    _controller.dispose();
+    _pending.clear();
+    super.dispose();
+  }
+
+  Future<void> _showNotification(AppNotification notif) async {
+    // Queue rather than drop: a second error during the dwell window used to
+    // be discarded with no retry.
+    if (_controller.isAnimating) {
+      _pending.add(notif);
+      return;
+    }
+
+    setState(() {
+      _currentNotification = notif;
+    });
+
+    await _controller.forward();
+    await Future<void>.delayed(const Duration(seconds: 4));
+
+    if (!mounted) return;
+    await _controller.reverse();
+    // Re-checked after the 600ms reverse: the listener can be disposed while
+    // it plays, and the previous single check happened before it.
+    if (!mounted) return;
+    setState(() {
+      _currentNotification = null;
+    });
+
+    if (_pending.isNotEmpty && mounted) {
+      unawaited(_showNotification(_pending.removeFirst()));
+    }
+  }
+
+  @override
+  void dispose() {
+    _notificationEffect();
+    _controller.dispose();
+    _pending.clear();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _offsetAnimation,
+      builder: (context, child) {
+        return Stack(
+          alignment: Alignment.topCenter,
+          children: [
+            widget.child,
+            if (_currentNotification != null)
+              Positioned(
+                top: 40,
+                left: 0,
+                right: 0,
+                child: SlideTransition(
+                  position: _offsetAnimation,
+                  child: Center(
+                    child: Material(
+                      color: Colors.transparent,
+                      child: Builder(
+                        builder: (context) {
+                          final cs = Theme.of(context).colorScheme;
+                          final (
+                            bgColor,
+                            fgColor,
+                          ) = switch (_currentNotification!.level) {
+                            AppNotificationLevel.error => (
+                              cs.error,
+                              cs.onError,
+                            ),
+                            AppNotificationLevel.warning => (
+                              cs.tertiary,
+                              cs.onTertiary,
+                            ),
+                            AppNotificationLevel.success => (
+                              cs.primary,
+                              cs.onPrimary,
+                            ),
+                          };
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 12,
+                            ),
+                            decoration: BoxDecoration(
+                              color: bgColor,
+                              borderRadius: BorderRadius.circular(100),
+                              border: Border.all(
+                                color: cs.onSurface.withValues(alpha: 0.1),
+                              ),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Colors.black26,
+                                  blurRadius: 20,
+                                  offset: Offset(0, 10),
+                                ),
+                              ],
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  switch (_currentNotification!.level) {
+                                    AppNotificationLevel.error =>
+                                      Icons.error_outline_rounded,
+                                    AppNotificationLevel.warning =>
+                                      Icons.warning_amber_rounded,
+                                    AppNotificationLevel.success =>
+                                      Icons.check_circle_outline_rounded,
+                                  },
+                                  color: fgColor,
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 12),
+                                Flexible(
+                                  child: Text(
+                                    _currentNotification!.message,
+                                    style: TextStyle(
+                                      color: fgColor,
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
