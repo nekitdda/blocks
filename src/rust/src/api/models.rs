@@ -526,6 +526,42 @@ pub struct UserAccountDto {
     pub avatar_url: Option<String>,
 }
 
+/// An account signed in on this device, for the account switcher.
+#[flutter_rust_bridge::frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredAccountDto {
+    pub uid: i64,
+    pub login: String,
+    pub display_name: Option<String>,
+    pub full_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub has_plus: bool,
+    /// The account whose session is (or will be) open.
+    pub is_active: bool,
+    /// The token was revoked or expired; the user has to sign in again.
+    pub needs_login: bool,
+    pub added_at: i64,
+    pub last_active_at: i64,
+}
+
+#[flutter_rust_bridge::frb(ignore)]
+impl StoredAccountDto {
+    pub(crate) fn from_stored(a: crate::db::StoredAccount, active_uid: Option<u64>) -> Self {
+        Self {
+            uid: a.uid as i64,
+            is_active: active_uid == Some(a.uid),
+            needs_login: a.token.is_empty(),
+            login: a.login,
+            display_name: a.display_name,
+            full_name: a.full_name,
+            avatar_url: a.avatar_url,
+            has_plus: a.has_plus,
+            added_at: a.added_at,
+            last_active_at: a.last_active_at,
+        }
+    }
+}
+
 #[flutter_rust_bridge::frb(ignore)]
 impl UserAccountDto {
     pub fn from_yandex(

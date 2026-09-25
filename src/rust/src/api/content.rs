@@ -85,12 +85,12 @@ pub async fn search(ctx: &AppContext, query: String) -> Option<SearchResultsDto>
 }
 
 pub async fn set_download_path(ctx: &AppContext, path: String) -> Result<(), AppError> {
-    ctx.core.db.lock().await.save_download_path(&path).await?;
+    ctx.core.device_db.lock().await.save_download_path(&path).await?;
     Ok(())
 }
 
 pub async fn get_download_path(ctx: &AppContext) -> Result<Option<String>, AppError> {
-    ctx.core.db.lock().await.load_download_path().await
+    ctx.core.device_db.lock().await.load_download_path().await
 }
 
 enum DownloadDestination {

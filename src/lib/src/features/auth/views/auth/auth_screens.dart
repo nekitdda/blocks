@@ -1,101 +1,118 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/services.dart';
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_all/webview_all.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
+import 'package:youmuz/src/features/auth/views/auth/login_dialogs.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
 import 'package:youmuz/src/features/core/views/layout.dart';
+import 'package:youmuz/src/features/core/views/layout/header.dart';
 import 'package:youmuz/src/features/settings/services/update_service.dart';
 import 'package:youmuz/src/features/settings/views/update_dialog.dart';
-import 'package:youmuz/src/rust/api/auth.dart' as rust;
-import 'package:youmuz/src/rust/api/playback.dart' as rust;
 import 'package:youmuz/src/rust/api/simple.dart' as simple;
+import 'package:youmuz/src/ui/ui.dart';
+
+export 'package:youmuz/src/features/auth/views/auth/login_dialogs.dart';
 
 class RootScreen extends StatefulWidget {
   const RootScreen({super.key});
+
   @override
   State<RootScreen> createState() => _RootScreenState();
 }
 
 class _RootScreenState extends State<RootScreen> {
-  bool _hasLoadedState = false;
+  bool _updateChecked = false;
+
+  void _checkForUpdatesOnce() {
+    if (_updateChecked) return;
+    _updateChecked = true;
+    unawaited(() async {
+      try {
+        final ctx = appContextSignal.value;
+        if (ctx == null) return;
+        if (!await simple.isUpdateCheckEnabled(ctx: ctx)) return;
+        final info = await UpdateService.checkForUpdates();
+        if (info != null && info.hasUpdate && mounted) {
+          UpdateDialog.show(context, initialInfo: info);
+        }
+      } on Object catch (e) {
+        debugPrint('Error checking for updates: $e');
+      }
+    }());
+  }
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final authState = authSignal.value;
-
+        final authState = authSignal();
         return authState.map(
           data: (isLoggedIn) {
             if (isLoggedIn) {
-              if (!_hasLoadedState) {
-                _hasLoadedState = true;
-                unawaited(
-                  Future.microtask(() {
-                    unawaited(() async {
-                      final ctx = appContextSignal.value;
-                      if (ctx == null) return;
-                      final state = await rust.restoreSavedState(ctx: ctx);
-                      if (state != null) {
-                        await rust.restoreAndPlay(
-                          ctx: ctx,
-                          trackId: state.trackId,
-                          positionMs: state.positionMs,
-                          isPlaying: false,
-                        );
-                      }
-
-                      // Auto check for updates on launch if enabled
-                      unawaited(() async {
-                        try {
-                          final isUpdateCheckEnabled = await simple
-                              .isUpdateCheckEnabled(ctx: ctx);
-                          if (isUpdateCheckEnabled) {
-                            final info = await UpdateService.checkForUpdates();
-                            if (info != null &&
-                                info.hasUpdate &&
-                                context.mounted) {
-                              UpdateDialog.show(context, initialInfo: info);
-                            }
-                          }
-                        } on Object catch (e) {
-                          debugPrint('Error checking for updates: $e');
-                        }
-                      }());
-                    }());
-                  }),
-                );
-              }
+              WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdatesOnce());
               return const AppLayout();
             }
             return const LoginScreen();
           },
-          error: (dynamic e, dynamic _) =>
-              Scaffold(body: Center(child: Text('Ошибка: $e'))),
-          loading: () =>
-              const Scaffold(body: Center(child: M3ELoadingIndicator())),
+          error: (Object e, _) => LoginScreen(initialError: '$e'),
+          loading: () => const _Splash(),
         );
       },
     );
   }
 }
 
+class _Splash extends StatelessWidget {
+  const _Splash();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: GColors.background,
+      body: Center(child: GraphiteLogo(showLabel: false)),
+    );
+  }
+}
+
+/// Extracts the OAuth token from a pasted token or redirect URL.
+String? parseTokenInput(String input) {
+  var token = input.trim();
+  try {
+    token = Uri.decodeFull(token);
+  } on Object catch (_) {}
+  token = token.replaceAll(RegExp(r'[\u200B-\u200D\uFEFF\u00A0]'), '');
+  token = token.replaceAll(RegExp(r'[^\x21-\x7E]'), '');
+  final urlMatch = RegExp('access_token=([^&/#?]+)').firstMatch(token);
+  if (urlMatch != null) {
+    token = urlMatch.group(1)!;
+  } else {
+    final directMatch = RegExp('(y0_[a-zA-Z0-9._-]+)').firstMatch(token);
+    if (directMatch != null) token = directMatch.group(1)!;
+  }
+  if (token.isEmpty || token.startsWith('http')) return null;
+  return token;
+}
+
+/// Sign-in screen. With [addingAccount] it is shown over the running app to
+/// add another account; the current one stays signed in.
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  const LoginScreen({super.key, this.addingAccount = false, this.initialError});
+
+  final bool addingAccount;
+  final String? initialError;
+
   @override
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
 class _LoginScreenState extends State<LoginScreen> {
   final _tokenController = TextEditingController();
+  bool _busy = false;
+  late String? _error = widget.initialError;
 
   @override
   void dispose() {
@@ -103,794 +120,220 @@ class _LoginScreenState extends State<LoginScreen> {
     super.dispose();
   }
 
-  void _showWebView() {
+  Future<void> _submit(String? token) async {
+    if (token == null || _busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final error = await login(token);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _error = error;
+    });
+    if (error == null && widget.addingAccount) {
+      Navigator.of(context).maybePop();
+    }
+  }
+
+  Future<void> _webLogin() async {
+    if (widget.addingAccount) {
+      // The embedded browser still holds the current account's Yandex
+      // session; without this Yandex would authorize that account again.
+      await WebViewCookieManager().clearCookies();
+    }
+    if (!mounted) return;
+    final String? token;
     if (Platform.isAndroid) {
-      Navigator.push<void>(
+      token = await Navigator.push<String>(
         context,
-        MaterialPageRoute<void>(
+        MaterialPageRoute<String>(
           fullscreenDialog: true,
           builder: (_) => const YandexLoginDialog(fullscreen: true),
         ),
       );
     } else {
-      unawaited(
-        showDialog<void>(
-          context: context,
-          builder: (context) => const YandexLoginDialog(),
-        ),
-      );
+      token = await showGDialog<String>(context, builder: (_) => const YandexLoginDialog());
     }
+    await _submit(token);
   }
 
-  void _showDeviceLogin() {
+  Future<void> _deviceLogin() async {
+    final String? token;
     if (Platform.isAndroid) {
-      Navigator.push<void>(
+      token = await Navigator.push<String>(
         context,
-        MaterialPageRoute<void>(
+        MaterialPageRoute<String>(
           fullscreenDialog: true,
           builder: (_) => const YandexDeviceLoginDialog(fullscreen: true),
         ),
       );
     } else {
-      unawaited(
-        showDialog<void>(
-          context: context,
-          builder: (context) => const YandexDeviceLoginDialog(),
-        ),
-      );
+      token = await showGDialog<String>(context, builder: (_) => const YandexDeviceLoginDialog());
     }
+    await _submit(token);
   }
 
-  void _handleLogin(String val) {
-    var token = val.trim();
-    try {
-      token = Uri.decodeFull(token);
-    } on Object catch (_) {}
-
-    token = token.replaceAll(RegExp(r'[\u200B-\u200D\uFEFF\u00A0]'), '');
-    token = token.replaceAll(RegExp(r'[^\x21-\x7E]'), '');
-
-    final urlMatch = RegExp('access_token=([^&/#?]+)').firstMatch(token);
-    if (urlMatch != null) {
-      token = urlMatch.group(1)!;
-    } else {
-      final directMatch = RegExp('(y0_[a-zA-Z0-9._-]+)').firstMatch(token);
-      if (directMatch != null) {
-        token = directMatch.group(1)!;
-      }
+  void _submitField() {
+    final token = parseTokenInput(_tokenController.text);
+    if (token == null) {
+      setState(() => _error = 'Вставьте токен y0_… или ссылку с access_token.');
+      return;
     }
-
-    if (token.isNotEmpty && !token.startsWith('http')) {
-      unawaited(login(token));
-    }
+    unawaited(_submit(token));
   }
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final theme = Theme.of(context);
-        final isDesktop =
-            Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-        final isCustomTitlebar = isDesktop && customTitlebarSignal.value;
-        final showBrowserFirst = Platform.isLinux;
+    final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    // Embedded WebView is unreliable on Linux: offer the code flow first.
+    final codeFirst = Platform.isLinux;
+    final webButton = GButton(
+      label: 'Войти через Яндекс',
+      icon: LucideIcons.globe,
+      size: GButtonSize.lg,
+      expand: true,
+      variant: codeFirst ? GButtonVariant.secondary : GButtonVariant.primary,
+      onPressed: _busy ? null : () => unawaited(_webLogin()),
+    );
+    final codeButton = GButton(
+      label: 'Войти по коду устройства',
+      icon: LucideIcons.monitor,
+      size: GButtonSize.lg,
+      expand: true,
+      variant: codeFirst ? GButtonVariant.primary : GButtonVariant.secondary,
+      onPressed: _busy ? null : () => unawaited(_deviceLogin()),
+    );
 
-        final webViewButton = showBrowserFirst
-            ? OutlinedButton.icon(
-                onPressed: _showWebView,
-                icon: const Icon(Icons.open_in_new_rounded),
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 50),
-                ),
-                label: const Text(
-                  'Открыть окно входа',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-              )
-            : ElevatedButton.icon(
-                onPressed: _showWebView,
-                icon: const Icon(Icons.open_in_new_rounded),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: theme.colorScheme.primary,
-                  foregroundColor: Colors.black,
-                  minimumSize: const Size(double.infinity, 50),
-                ),
-                label: const Text(
-                  'Открыть окно входа',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-              );
-
-        final browserButton = showBrowserFirst
-            ? ElevatedButton.icon(
-                onPressed: _showDeviceLogin,
-                icon: const Icon(Icons.devices_rounded),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: theme.colorScheme.primary,
-                  foregroundColor: Colors.black,
-                  minimumSize: const Size(double.infinity, 50),
-                ),
-                label: const Text(
-                  'Войти через браузер',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-              )
-            : OutlinedButton.icon(
-                onPressed: _showDeviceLogin,
-                icon: const Icon(Icons.devices_rounded),
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 50),
-                ),
-                label: const Text(
-                  'Войти через браузер',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-              );
-
-        return Scaffold(
-          resizeToAvoidBottomInset: false,
-          body: Stack(
+    final card = ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 400),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Align(alignment: Alignment.centerLeft, child: GraphiteLogo()),
+          const SizedBox(height: 40),
+          Text(
+            widget.addingAccount ? 'Добавить аккаунт' : 'Вход в YouMuz',
+            style: GText.headline(36),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            widget.addingAccount
+                ? 'Войдите в другой аккаунт Яндекса. Текущий останется в списке — переключаться можно через аватар в шапке.'
+                : 'Альтернативный клиент Яндекс Музыки. Войдите в аккаунт Яндекса — позже можно добавить ещё несколько.',
+            style: GText.sm(color: GColors.mutedForeground).copyWith(height: 1.6),
+          ),
+          const SizedBox(height: 32),
+          if (codeFirst) ...[codeButton, const SizedBox(height: 8), webButton] else ...[
+            webButton,
+            const SizedBox(height: 8),
+            codeButton,
+          ],
+          const SizedBox(height: 28),
+          Row(
             children: [
-              Positioned.fill(
-                child: Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        theme.colorScheme.surfaceContainerHighest,
-                        theme.colorScheme.surface,
+              const Expanded(child: GDivider()),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Text('или вставьте токен', style: GText.xs(color: GColors.mutedForeground)),
+              ),
+              const Expanded(child: GDivider()),
+            ],
+          ),
+          const SizedBox(height: 20),
+          TextField(
+            controller: _tokenController,
+            enabled: !_busy,
+            style: GText.sm(),
+            onSubmitted: (_) => _submitField(),
+            decoration: InputDecoration(
+              hintText: 'y0_… или ссылка с access_token',
+              suffixIcon: Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: _busy
+                    ? const Padding(
+                        padding: EdgeInsets.all(10),
+                        child: SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: GColors.brand),
+                        ),
+                      )
+                    : GIconButton(
+                        icon: LucideIcons.arrowRight,
+                        tooltip: 'Войти',
+                        onPressed: _submitField,
+                      ),
+              ),
+              suffixIconConstraints: const BoxConstraints(minWidth: 40, minHeight: 36),
+            ),
+          ),
+          const SizedBox(height: 10),
+          AnimatedSwitcher(
+            duration: GDurations.fast,
+            child: _error != null
+                ? Row(
+                    key: ValueKey(_error),
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.only(top: 1),
+                        child: Icon(LucideIcons.circleAlert, size: 14, color: GColors.destructive),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(_error!, style: GText.xs(color: GColors.destructive))),
+                    ],
+                  )
+                : Text(
+                    'Используйте поле, только если знаете, откуда взять токен.',
+                    key: const ValueKey('hint'),
+                    style: GText.xs(color: GColors.mutedForeground),
+                  ),
+          ),
+        ],
+      ),
+    );
+
+    return Scaffold(
+      backgroundColor: GColors.background,
+      body: SafeArea(
+        child: Column(
+          children: [
+            SignalBuilder(
+              builder: (context) {
+                final custom = isDesktop && customTitlebarSignal();
+                final bar = SizedBox(
+                  height: 56,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Row(
+                      children: [
+                        if (widget.addingAccount)
+                          GButton(
+                            label: 'Отмена',
+                            icon: LucideIcons.arrowLeft,
+                            variant: GButtonVariant.ghost,
+                            size: GButtonSize.sm,
+                            onPressed: _busy ? null : () => Navigator.of(context).maybePop(),
+                          ),
+                        const Spacer(),
+                        if (custom && !widget.addingAccount) const WindowButtons(),
                       ],
                     ),
                   ),
-                  child: Center(
-                    child: Card(
-                      elevation: 8,
-                      child: Container(
-                        width: 400,
-                        padding: const EdgeInsets.all(32),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              Icons.music_note_rounded,
-                              size: 64,
-                              color: Theme.of(context).colorScheme.primary,
-                            ),
-                            const SizedBox(height: 24),
-                            const Text(
-                              'YouMuz',
-                              style: TextStyle(
-                                fontSize: 32,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            Text(
-                              'Вход через Яндекс',
-                              style: TextStyle(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                            const SizedBox(height: 32),
-                            if (showBrowserFirst) ...[
-                              browserButton,
-                              const SizedBox(height: 12),
-                              webViewButton,
-                            ] else ...[
-                              webViewButton,
-                              const SizedBox(height: 12),
-                              browserButton,
-                            ],
-                            Padding(
-                              padding: const EdgeInsets.symmetric(
-                                vertical: 24,
-                              ),
-                              child: Row(
-                                children: [
-                                  const Expanded(child: Divider()),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 16,
-                                    ),
-                                    child: Text(
-                                      'Или введите токен',
-                                      style: TextStyle(
-                                        color: theme.colorScheme.onSurface
-                                            .withValues(alpha: 0.24),
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                  ),
-                                  const Expanded(child: Divider()),
-                                ],
-                              ),
-                            ),
-                            TextField(
-                              controller: _tokenController,
-                              decoration: InputDecoration(
-                                labelText: 'Ссылка или OAuth токен',
-                                hintText:
-                                    'https://music.yandex.ru/#access_token=y0_...',
-                                helperText:
-                                    'Используйте это поле только если хотите ввести готовый OAuth токен вручную.',
-                                border: const OutlineInputBorder(),
-                                suffixIcon: IconButton(
-                                  icon: const Icon(Icons.login_rounded),
-                                  onPressed: () =>
-                                      _handleLogin(_tokenController.text),
-                                ),
-                              ),
-                              onSubmitted: _handleLogin,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              if (isCustomTitlebar)
-                const Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: SizedBox(
-                    height: 32,
-                    child: WindowCaption(
-                      brightness: Brightness.dark,
-                      backgroundColor: Colors.transparent,
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-class YandexLoginDialog extends StatefulWidget {
-  final bool fullscreen;
-
-  const YandexLoginDialog({super.key, this.fullscreen = false});
-
-  @override
-  State<YandexLoginDialog> createState() => _YandexLoginDialogState();
-}
-
-class _YandexLoginDialogState extends State<YandexLoginDialog> {
-  late final WebViewController _controller;
-  bool _isFinalized = false;
-  bool _isFetchingToken = false;
-  static final _tokenRegExp = RegExp('access_token=(y0_[^&]+)');
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = WebViewController();
-    unawaited(_controller.setJavaScriptMode(JavaScriptMode.unrestricted));
-    unawaited(
-      _controller.setUserAgent(
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      ),
-    );
-    unawaited(
-      _controller.setNavigationDelegate(
-        NavigationDelegate(
-          onPageStarted: (url) async {
-            unawaited(_parseToken(url));
-          },
-          onUrlChange: (change) async {
-            if (change.url != null) {
-              unawaited(_parseToken(change.url!));
-            }
-          },
-          onNavigationRequest: (request) async {
-            return await _parseToken(request.url);
-          },
-          onPageFinished: (url) async {
-            unawaited(_parseToken(url));
-            final currentUrl = await _controller.currentUrl();
-            if (currentUrl != null) {
-              unawaited(_parseToken(currentUrl));
-            }
-          },
-        ),
-      ),
-    );
-    unawaited(
-      _controller.loadRequest(
-        Uri.parse('https://passport.yandex.ru/pwl-yandex/auth/'),
-      ),
-    );
-  }
-
-  /// Strip secrets before logging a URL.
-  ///
-  /// This method is called from every navigation callback, and the branch it
-  /// exists to detect is the OAuth redirect that carries `access_token`. The
-  /// raw URL was being `debugPrint`ed, which lands in logcat / stdout and is
-  /// world-readable on pre-4.1 Android and in any crash report.
-  static String _redactUrl(String url) {
-    return url.replaceAll(RegExp(r'((?:access_token|oauth_token|token)=)[^&\s]+', caseSensitive: false), r'$1<redacted>');
-  }
-
-  Future<NavigationDecision> _parseToken(String urlString) async {
-    if (_isFinalized) return NavigationDecision.navigate;
-
-    debugPrint('🌐 URL: ${_redactUrl(urlString)}');
-
-    // 1. Intercept from URL (OAuth redirect)
-    final match = _tokenRegExp.firstMatch(urlString);
-    if (match != null) {
-      final token = match.group(1);
-      if (token != null) {
-        await _handleFoundToken(token);
-        return NavigationDecision.prevent;
-      }
-    }
-
-    // 2. Fetch token if already in profile but not yet authorized
-    if (!_isFetchingToken &&
-        (urlString.startsWith('https://id.yandex.ru') ||
-            urlString.startsWith('https://passport.yandex.ru/profile'))) {
-      debugPrint('🔍 Authorized! Getting token via official desktop client...');
-      _isFetchingToken = true;
-
-      unawaited(
-        _controller.loadRequest(
-          Uri.parse(
-            'https://oauth.yandex.ru/authorize?response_type=token&client_id=97fe03033fa34407ac9bcf91d5afed5b',
-          ),
-        ),
-      );
-
-      return NavigationDecision.prevent;
-    }
-
-    return NavigationDecision.navigate;
-  }
-
-  Future<void> _handleFoundToken(String token) async {
-    if (_isFinalized) return;
-    _isFinalized = true;
-    await login(token);
-
-    if (mounted) {
-      Navigator.of(context).pop();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (widget.fullscreen) {
-      return Scaffold(
-        appBar: AppBar(
-          leading: const BackButton(),
-          title: const Text('Вход через Яндекс'),
-        ),
-        body: WebViewWidget(controller: _controller),
-      );
-    }
-
-    return Dialog(
-      child: SizedBox(
-        width: 1000,
-        height: 800,
-        child: Column(
-          children: [
+                );
+                return custom ? DragToMoveArea(child: bar) : bar;
+              },
+            ),
             Expanded(
-              child: WebViewWidget(controller: _controller),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Row(
-                children: [
-                  TextButton.icon(
-                    onPressed: () async {
-                      await WebViewCookieManager().clearCookies();
-                      if (context.mounted) Navigator.pop(context);
-                    },
-                    icon: const Icon(
-                      Icons.delete_sweep_rounded,
-                      color: Colors.redAccent,
-                    ),
-                    label: const Text(
-                      'СБРОСИТЬ БРАУЗЕР',
-                      style: TextStyle(color: Colors.redAccent),
-                    ),
-                  ),
-                  const Spacer(),
-                  TextButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text('ЗАКРЫТЬ'),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class YandexDeviceLoginDialog extends StatefulWidget {
-  final bool fullscreen;
-
-  const YandexDeviceLoginDialog({super.key, this.fullscreen = false});
-
-  @override
-  State<YandexDeviceLoginDialog> createState() =>
-      _YandexDeviceLoginDialogState();
-}
-
-class _YandexDeviceLoginDialogState extends State<YandexDeviceLoginDialog> {
-  String? _userCode;
-  String? _deviceCode;
-  String? _verificationUrl;
-  int _interval = 5;
-  Timer? _timer;
-  bool _isLoading = true;
-  String? _error;
-  bool _isFinalized = false;
-  /// Set in `dispose`. Distinct from `mounted` because the poll timer is armed
-  /// from *after* an `await`, at which point `dispose` may already have run.
-  bool _disposed = false;
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_initDeviceFlow());
-  }
-
-  @override
-  void dispose() {
-    _disposed = true;
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> _initDeviceFlow() async {
-    final client = HttpClient();
-    try {
-      final request = await client.postUrl(
-        Uri.parse('https://oauth.yandex.ru/device/code'),
-      );
-      request.headers.set('content-type', 'application/x-www-form-urlencoded');
-      request.write('client_id=23cabbbdc6cd418abb4b39c32c41195d');
-      final response = await request.close();
-      final body = await response.transform(utf8.decoder).join();
-
-      // Every `setState` below is reached after an `await`, so the dialog may
-      // already be closed: `setState() called after dispose()` otherwise.
-      if (!mounted) return;
-
-      if (response.statusCode == 200) {
-        final decoded = jsonDecode(body);
-        if (decoded is! Map<String, dynamic>) {
-          setState(() {
-            _error = 'Ответ сервера не распознан.';
-            _isLoading = false;
-          });
-          return;
-        }
-        setState(() {
-          _userCode = decoded['user_code'] as String?;
-          _deviceCode = decoded['device_code'] as String?;
-          _verificationUrl = decoded['verification_url'] as String?;
-          _interval = (decoded['interval'] as num?)?.toInt() ?? 5;
-          _isLoading = false;
-        });
-        _startPolling();
-      } else {
-        setState(() {
-          _error = 'Не удалось получить код устройства от Яндекс.';
-          _isLoading = false;
-        });
-      }
-    } on Object catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = 'Ошибка сети: $e';
-        _isLoading = false;
-      });
-    } finally {
-      client.close();
-    }
-  }
-
-  void _startPolling() {
-    // `dispose` already ran if the dialog was closed during the device-code
-    // request; starting the timer then would poll for the life of the process
-    // with no way to cancel it.
-    if (!mounted || _disposed) return;
-    _timer?.cancel();
-    _timer = Timer.periodic(Duration(seconds: _interval), (timer) {
-      unawaited(_pollToken());
-    });
-  }
-
-  Future<void> _pollToken() async {
-    if (_isFinalized || _deviceCode == null || _disposed) return;
-
-    final client = HttpClient();
-    try {
-      final request = await client.postUrl(
-        Uri.parse('https://oauth.yandex.ru/token'),
-      );
-      request.headers.set('content-type', 'application/x-www-form-urlencoded');
-      request.write(
-        'grant_type=device_code'
-        '&client_id=23cabbbdc6cd418abb4b39c32c41195d'
-        '&client_secret=53bc75238f0c4d08a118e51fe9203300'
-        '&code=$_deviceCode',
-      );
-      final response = await request.close();
-      final body = await response.transform(utf8.decoder).join();
-
-      if (_disposed) return;
-      final decoded = jsonDecode(body);
-      // A captive portal or proxy returning HTML used to throw a cast error
-      // that was only `debugPrint`ed, leaving the poller ticking every 5s
-      // forever with no user-visible error.
-      if (decoded is! Map<String, dynamic>) {
-        _timer?.cancel();
-        if (mounted) {
-          setState(() => _error = 'Ответ сервера не распознан.');
-        }
-        return;
-      }
-      final data = decoded;
-
-      if (response.statusCode == 200) {
-        final token = data['access_token'] as String?;
-        if (token != null) {
-          _timer?.cancel();
-          await _handleFoundToken(token);
-        }
-      } else {
-        final error = data['error'] as String?;
-        if (error != 'authorization_pending') {
-          _timer?.cancel();
-          if (mounted) {
-            setState(() {
-              _error =
-                  data['error_description'] as String? ??
-                  'Ошибка авторизации ($error).';
-            });
-          }
-        }
-      }
-    } on Object catch (e) {
-      debugPrint('Error polling token: $e');
-    } finally {
-      client.close();
-    }
-  }
-
-  Future<void> _handleFoundToken(String token) async {
-    if (_isFinalized) return;
-    _isFinalized = true;
-    await login(token);
-
-    if (mounted) {
-      Navigator.of(context).pop();
-    }
-  }
-
-  void _openBrowser() {
-    final url = _verificationUrl ?? 'https://ya.ru/device';
-    unawaited(
-      () async {
-        try {
-          final uri = Uri.parse(url);
-          if (await canLaunchUrl(uri)) {
-            await launchUrl(uri, mode: LaunchMode.externalApplication);
-          }
-        } on Object catch (e) {
-          debugPrint('Error launching browser: $e');
-        }
-      }(),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    Widget content;
-    if (_isLoading) {
-      content = const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            M3ELoadingIndicator(),
-            SizedBox(height: 16),
-            Text('Получение кода авторизации...'),
-          ],
-        ),
-      );
-    } else if (_error != null) {
-      content = Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(
-                Icons.error_outline_rounded,
-                color: Colors.redAccent,
-                size: 48,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                _error!,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.redAccent),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: () {
-                  setState(() {
-                    _isLoading = true;
-                    _error = null;
-                  });
-                  unawaited(_initDeviceFlow());
-                },
-                child: const Text('Повторить'),
-              ),
-            ],
-          ),
-        ),
-      );
-    } else {
-      content = Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Text(
-            'Перейдите на страницу ya.ru/device и введите код подтверждения:',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 16),
-          ),
-          const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerHigh,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: theme.colorScheme.outlineVariant,
-              ),
-            ),
-            child: Text(
-              _userCode ?? '',
-              style: const TextStyle(
-                fontSize: 32,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 4,
-                fontFamily: 'monospace',
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-          Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            alignment: WrapAlignment.center,
-            children: [
-              OutlinedButton.icon(
-                onPressed: () async {
-                  if (_userCode != null) {
-                    await Clipboard.setData(ClipboardData(text: _userCode!));
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('Код скопирован в буфер обмена'),
-                          duration: Duration(seconds: 2),
-                        ),
-                      );
-                    }
-                  }
-                },
-                icon: const Icon(Icons.copy_rounded),
-                label: const Text('Копировать код'),
-              ),
-              ElevatedButton.icon(
-                onPressed: _openBrowser,
-                icon: const Icon(Icons.open_in_browser_rounded),
-                label: const Text('Открыть ссылку'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const M3ECircularWavyProgressIndicator(
-                strokeWidth: 2,
-                size: 16,
-              ),
-              const SizedBox(width: 12),
-              Text(
-                'Ожидание ввода кода на сайте',
-                style: TextStyle(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontSize: 13,
+              child: Center(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(24, 8, 24, 48),
+                  child: card,
                 ),
               ),
-            ],
-          ),
-        ],
-      );
-    }
-
-    if (widget.fullscreen) {
-      return Scaffold(
-        appBar: AppBar(
-          leading: const BackButton(),
-          title: const Text('Вход по коду устройства'),
-        ),
-        body: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.devices_rounded,
-                  color: theme.colorScheme.primary,
-                  size: 28,
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  'Вход по коду устройства',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Divider(height: 32),
-                content,
-              ],
             ),
-          ),
-        ),
-      );
-    }
-
-    return Dialog(
-      child: Container(
-        width: 500,
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.devices_rounded,
-                  color: theme.colorScheme.primary,
-                  size: 28,
-                ),
-                const SizedBox(width: 12),
-                const Text(
-                  'Вход по коду устройства',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Spacer(),
-                IconButton(
-                  icon: const Icon(Icons.close_rounded),
-                  onPressed: () => Navigator.pop(context),
-                ),
-              ],
-            ),
-            const Divider(height: 32),
-            content,
           ],
         ),
       ),

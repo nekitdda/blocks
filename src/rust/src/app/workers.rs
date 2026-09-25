@@ -56,16 +56,15 @@ pub fn spawn_bridge_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<boo
         // redundant. Keep only the newest intent and flush it on the interval.
         let mut pending_state: Option<(String, u64, bool)> = None;
         let mut last_vibe_active = false;
+        // Last track written to the account's listening history.
+        let mut last_history_id: Option<String> = None;
 
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        // Flush whatever is still pending before exiting.
-                        if let Some((track_id, position_ms, is_playing)) = pending_state.take() {
-                            let mut db = ctx.core.db.lock().await;
-                            let _ = db.save_playback_state(&track_id, position_ms, is_playing).await;
-                        }
+                        // `AppContext::shutdown` writes the final playback
+                        // state once the audio actor has stopped.
                         break;
                     }
                 }
@@ -74,6 +73,24 @@ pub fn spawn_bridge_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<boo
                     let (liked, disliked) = audio_state.read().await.liked.snapshot();
                     let state = crate::api::playback::get_playback_state_internal(&audio_signals, &liked, &disliked);
                     ctx.send_event(AppEvent::PlaybackStateChanged(state));
+
+                    // A track counts as listened once it actually plays (a
+                    // restored, paused session does not).
+                    let current_id = audio_signals.current_track_id.get();
+                    if current_id.is_some()
+                        && current_id != last_history_id
+                        && audio_signals.is_playing.get()
+                        && let Some(track) = audio_signals.current_track.get()
+                    {
+                        last_history_id = current_id;
+                        let db = ctx.core.db.clone();
+                        tokio::spawn(async move {
+                            let metadata = crate::api::library::track_to_metadata(track);
+                            if let Err(e) = db.lock().await.record_played_track(metadata).await {
+                                tracing::warn!("Failed to record listening history: {:?}", e);
+                            }
+                        });
+                    }
 
                     // Record intent only; the write happens on `save_interval`.
                     if let Some(track_id) = audio_signals.current_track_id.get() {

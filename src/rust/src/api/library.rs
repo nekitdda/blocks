@@ -600,7 +600,7 @@ pub async fn move_track_in_playlist(
 
 /// Single `Track` -> DB-metadata conversion shared by the fetch-top-up path
 /// and the server-payload seeding path, so both store identical rows.
-fn yandex_track_to_metadata(
+pub(crate) fn track_to_metadata(
     mut t: yandex_music::model::track::Track,
 ) -> crate::storage::db::TrackMetadata {
     let artists: Vec<crate::api::models::TrackArtistDto> = t
@@ -640,7 +640,7 @@ async fn fetch_and_save_missing_metadata(
 
     for chunk in missing_ids.chunks(50) {
         if let Ok(tracks) = ctx.core.api.fetch_tracks(chunk.to_vec()).await {
-            let to_save: Vec<_> = tracks.into_iter().map(yandex_track_to_metadata).collect();
+            let to_save: Vec<_> = tracks.into_iter().map(track_to_metadata).collect();
             // One transaction for the whole chunk. `ctx.core.db` is a single
             // global mutex, so 50 separate upserts meant 50 WAL transactions
             // holding it and blocking the playback-progress writer, the
@@ -658,7 +658,7 @@ async fn fetch_and_save_missing_metadata(
     }
 }
 
-fn metadata_to_dto(
+pub(crate) fn metadata_to_dto(
     m: crate::storage::db::TrackMetadata,
     is_liked: bool,
     is_disliked: bool,
@@ -768,7 +768,7 @@ pub(crate) async fn build_track_dtos_from_server_tracks(
     {
         let mut db = ctx.core.db.lock().await;
         for t in tracks {
-            let m = yandex_track_to_metadata(t);
+            let m = track_to_metadata(t);
             if let Err(e) = db.upsert_track_metadata(m).await {
                 tracing::error!("Failed to upsert track metadata in DB: {:?}", e);
             }

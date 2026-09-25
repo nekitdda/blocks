@@ -1,13 +1,12 @@
 import 'dart:async';
 
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
-import 'package:youmuz/src/features/core/theme/app_tokens.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
+import 'package:youmuz/src/features/core/providers/notification_provider.dart';
 import 'package:youmuz/src/features/playback/providers/lyrics_provider.dart';
 import 'package:youmuz/src/rust/api/content.dart' as rust;
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
 /// Lets the user disable individual lyrics sources. The order they're
 /// queried in is fixed (word-synced-capable sources first) and isn't
@@ -17,8 +16,8 @@ class LyricsProvidersDialog extends StatefulWidget {
 
   static void show(BuildContext context) {
     unawaited(
-      showDialog<void>(
-        context: context,
+      showGDialog<void>(
+        context,
         builder: (context) => const LyricsProvidersDialog(),
       ),
     );
@@ -31,6 +30,7 @@ class LyricsProvidersDialog extends StatefulWidget {
 class _LyricsProvidersDialogState extends State<LyricsProvidersDialog> {
   List<LyricsProviderSettingDto>? _providers;
   bool _loading = true;
+  bool _failed = false;
 
   @override
   void initState() {
@@ -40,124 +40,186 @@ class _LyricsProvidersDialogState extends State<LyricsProvidersDialog> {
 
   Future<void> _load() async {
     final ctx = appContextSignal.value;
-    if (ctx == null) return;
-    final providers = await rust.getLyricsProviderSettings(ctx: ctx);
-    if (mounted) {
+    if (ctx == null) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _failed = true;
+        });
+      }
+      return;
+    }
+    try {
+      final providers = await rust.getLyricsProviderSettings(ctx: ctx);
+      if (!mounted) return;
       setState(() {
         _providers = providers;
         _loading = false;
+        _failed = false;
+      });
+    } on Object catch (e) {
+      debugPrint('Failed to load lyrics providers: $e');
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _failed = true;
       });
     }
   }
 
+  void _retry() {
+    setState(() {
+      _loading = true;
+      _failed = false;
+    });
+    unawaited(_load());
+  }
+
   Future<void> _toggle(LyricsProviderSettingDto provider, bool enabled) async {
     final ctx = appContextSignal.value;
+    if (ctx == null || _providers == null) return;
+
+    _setEnabled(provider.id, enabled);
+    try {
+      await rust.setLyricsProviderEnabled(
+        ctx: ctx,
+        id: provider.id,
+        isEnabledFlag: enabled,
+      );
+      clearLyricsCache();
+    } on Object catch (e) {
+      if (mounted) _setEnabled(provider.id, !enabled);
+      showAppError('Не удалось сохранить источник: $e');
+    }
+  }
+
+  void _setEnabled(String id, bool enabled) {
     final providers = _providers;
-    if (ctx == null || providers == null) return;
-
-    final index = providers.indexWhere((p) => p.id == provider.id);
+    if (providers == null) return;
+    final index = providers.indexWhere((p) => p.id == id);
     if (index == -1) return;
-
+    final current = providers[index];
     setState(() {
       _providers = [...providers]
         ..[index] = LyricsProviderSettingDto(
-          id: provider.id,
-          name: provider.name,
+          id: current.id,
+          name: current.name,
           enabled: enabled,
         );
     });
-
-    await rust.setLyricsProviderEnabled(
-      ctx: ctx,
-      id: provider.id,
-      isEnabledFlag: enabled,
-    );
-    clearLyricsCache();
   }
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final primaryColor = cs.primary;
-
-    return AppDialog(
+    return GDialog(
       title: 'Источники текста песен',
-      titleIcon: Icons.lyrics_rounded,
-      titleStyle: TextStyle(
-        color: cs.onSurface,
-        fontWeight: FontWeight.bold,
-        fontSize: 18,
-      ),
-      contentWidth: 500,
-      content: _loading
-            ? const SizedBox(
-                height: 150,
-                child: Center(child: M3ELoadingIndicator()),
-              )
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Отключённые источники не используются при поиске '
-                    'текста. Порядок поиска фиксированный: сначала — '
-                    'источники с синхронизацией по словам.',
-                    style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
-                  ),
-                  const SizedBox(height: 16),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 400),
-                    child: ListView.separated(
-                      shrinkWrap: true,
-                      itemCount: _providers!.length,
-                      separatorBuilder: (context, index) =>
-                          const SizedBox(height: 8),
-                      itemBuilder: (context, index) {
-                        final provider = _providers![index];
-
-                        return Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: AppSpacing.md,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: cs.onSurface.withValues(alpha: 0.05),
-                            borderRadius: BorderRadius.circular(14),
-                            border: Border.all(
-                              color: cs.onSurface.withValues(alpha: 0.1),
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  provider.name,
-                                  style: TextStyle(
-                                    color: provider.enabled
-                                        ? cs.onSurface
-                                        : cs.onSurfaceVariant,
-                                    fontWeight: FontWeight.w600,
-                                    fontSize: 15,
-                                  ),
-                                ),
-                              ),
-                              Switch(
-                                value: provider.enabled,
-                                activeThumbColor: primaryColor,
-                                onChanged: (v) =>
-                                    unawaited(_toggle(provider, v)),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
-              ),
+      description:
+          'Отключённые источники не используются при поиске текста. Порядок '
+          'поиска фиксированный: сначала — источники с синхронизацией по '
+          'словам.',
+      width: 480,
+      content: _buildContent(),
       actions: [
-        AppDialog.closeButton(context),
+        GButton(label: 'Готово', onPressed: () => Navigator.of(context).pop()),
       ],
+    );
+  }
+
+  Widget _buildContent() {
+    if (_loading) {
+      return const SizedBox(height: 160, child: GLoader(padding: 0));
+    }
+    final providers = _providers;
+    if (_failed || providers == null) {
+      return GEmptyState(
+        icon: LucideIcons.circleAlert,
+        title: 'Не удалось загрузить источники',
+        message: 'Попробуйте ещё раз.',
+        compact: true,
+        action: GButton(
+          label: 'Повторить',
+          size: GButtonSize.sm,
+          variant: GButtonVariant.secondary,
+          onPressed: _retry,
+        ),
+      );
+    }
+    if (providers.isEmpty) {
+      return const GEmptyState(
+        icon: LucideIcons.micVocal,
+        title: 'Источники не найдены',
+        compact: true,
+      );
+    }
+    return SingleChildScrollView(
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(GRadius.xl),
+          border: Border.all(color: GColors.border),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(GRadius.xl - 1),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              for (var i = 0; i < providers.length; i++) ...[
+                if (i > 0) const GDivider(),
+                _ProviderRow(
+                  provider: providers[i],
+                  onChanged: (enabled) =>
+                      unawaited(_toggle(providers[i], enabled)),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ProviderRow extends StatelessWidget {
+  const _ProviderRow({required this.provider, required this.onChanged});
+
+  final LyricsProviderSettingDto provider;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return GPressable(
+      onTap: () => onChanged(!provider.enabled),
+      builder: (context, s) => AnimatedContainer(
+        duration: GDurations.fast,
+        curve: GCurves.standard,
+        color: s.highlighted ? GColors.secondary : const Color(0x00000000),
+        foregroundDecoration: s.focused
+            ? const BoxDecoration(
+                border: Border.fromBorderSide(BorderSide(color: GColors.ring)),
+              )
+            : null,
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                provider.name,
+                style: GText.sm(
+                  weight: GText.medium,
+                  color: provider.enabled
+                      ? GColors.foreground
+                      : GColors.mutedForeground,
+                ),
+              ),
+            ),
+            const SizedBox(width: 16),
+            // The row is the focus target (Space/Enter toggles); GPressable
+            // only reports hover while focusable.
+            ExcludeFocus(
+              child: Switch(value: provider.enabled, onChanged: onChanged),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -1,3 +1,3 @@
-mod token;
+mod accounts;
 
-pub use token::TokenProvider;
+pub use accounts::{AccountStore, validate_token};

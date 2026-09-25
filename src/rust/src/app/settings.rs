@@ -12,8 +12,14 @@ pub(crate) fn parse_setting<T: serde::de::DeserializeOwned>(
 }
 
 pub async fn load_persisted_settings(ctx: &AppContext) {
+    // Listening preferences (quality, equalizer, effects, Discord presence)
+    // belong to the account; volume and the output device to the device.
     let settings = {
         let mut db = ctx.core.db.lock().await;
+        db.load_all_settings().await.unwrap_or_default()
+    };
+    let device_settings = {
+        let mut db = ctx.core.device_db.lock().await;
         db.load_all_settings().await.unwrap_or_default()
     };
 
@@ -23,14 +29,14 @@ pub async fn load_persisted_settings(ctx: &AppContext) {
         // volume from an old ducking bug — on Android there's no in-app slider to
         // recover. Force the in-app volume to 100% on every launch and heal the
         // stored value, then delete the cfg block once the bad value is flushed.
-        let mut db = ctx.core.db.lock().await;
+        let mut db = ctx.core.device_db.lock().await;
         let _ = db.save_setting("volume", &100u8).await;
         let _ = ctx.audio.tx.send(AudioMessage::SetVolume(100)).await;
     }
 
     #[cfg(not(target_os = "android"))]
     {
-        let volume = parse_setting::<u8>(&settings, "volume").or(Some(100));
+        let volume = parse_setting::<u8>(&device_settings, "volume").or(Some(100));
 
         if let Some(volume) = volume {
             let _ = ctx.audio.tx.send(AudioMessage::SetVolume(volume)).await;
@@ -47,7 +53,7 @@ pub async fn load_persisted_settings(ctx: &AppContext) {
         ctx.audio.signals.discord_rpc.set(rpc_enabled);
     }
 
-    if let Some(device) = parse_setting::<String>(&settings, "audio_device")
+    if let Some(device) = parse_setting::<String>(&device_settings, "audio_device")
         && !device.is_empty()
     {
         ctx.audio.signals.selected_device.set(Some(device));

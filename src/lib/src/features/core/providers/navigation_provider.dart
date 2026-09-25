@@ -33,18 +33,24 @@ class NavState {
   int get hashCode => section.hashCode ^ (id?.hashCode ?? 0);
 }
 
-/// List of root sections (tabs)
+/// Root sections (tabs). `playlists` opens inside the collection tab.
 const List<AppSection> rootSections = [
   AppSection.home,
-  AppSection.search,
+  AppSection.wave,
   AppSection.liked,
-  AppSection.playlists,
+  AppSection.search,
   AppSection.account,
 ];
 
 /// Currently active root tab
 final FlutterSignal<AppSection> currentRootSignal = signal<AppSection>(
   AppSection.home,
+);
+
+/// Collection tab to show when the collection is opened through
+/// `AppSection.liked` (tracks) or `AppSection.playlists`.
+final FlutterSignal<AppSection> librarySectionRequestSignal = signal<AppSection>(
+  AppSection.liked,
 );
 
 /// Navigation stacks for each tab
@@ -90,20 +96,27 @@ final FlutterComputed<NavState> currentNavStateSignal = computed(
 
 /// Navigates to a new page
 void navigateTo(AppSection section, [String? id]) {
-  final newState = NavState(section, id);
+  if (id == null &&
+      (section == AppSection.playlists || section == AppSection.liked)) {
+    librarySectionRequestSignal.value = section;
+  }
+  final target = section == AppSection.playlists && id == null
+      ? AppSection.liked
+      : section;
+  final newState = NavState(target, id);
   final activeRoot = currentRootSignal.value;
 
   // Handle root section clicks
-  if (rootSections.contains(section) && id == null) {
-    if (activeRoot == section) {
+  if (rootSections.contains(target) && id == null) {
+    if (activeRoot == target) {
       // Reset stack to root if already active
       final newStacks = Map<AppSection, List<NavState>>.from(
         rootStacksSignal.value,
       );
-      newStacks[section] = [NavState(section)];
+      newStacks[target] = [NavState(target)];
       rootStacksSignal.value = newStacks;
     } else {
-      currentRootSignal.value = section;
+      currentRootSignal.value = target;
     }
     return;
   }
@@ -136,3 +149,12 @@ void goBack() {
 }
 
 void setSection(AppSection section) => navigateTo(section);
+
+/// Back to the home tab with every tab stack emptied. Used when the account
+/// changes: open pages (a playlist, an album) belong to the previous session.
+void resetNavigation() {
+  rootStacksSignal.value = {
+    for (final root in rootSections) root: [NavState(root)],
+  };
+  currentRootSignal.value = AppSection.home;
+}

@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:collection';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
 enum AppNotificationLevel { error, warning, success }
 
@@ -48,6 +50,8 @@ void showAppSuccess(String message) {
   );
 }
 
+/// Shows app notifications as a toast at the top center; notifications
+/// arriving while one is visible are queued, not dropped.
 class GlobalNotificationListener extends StatefulWidget {
   final Widget child;
   const GlobalNotificationListener({required this.child, super.key});
@@ -59,46 +63,33 @@ class GlobalNotificationListener extends StatefulWidget {
 
 class _GlobalNotificationListenerState extends State<GlobalNotificationListener>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-  late final Animation<Offset> _offsetAnimation;
+  late final AnimationController _controller = AnimationController(
+    duration: GDurations.slow,
+    reverseDuration: GDurations.medium,
+    vsync: this,
+  );
+  late final Animation<double> _curve = CurvedAnimation(
+    parent: _controller,
+    curve: GCurves.emphasized,
+    reverseCurve: GCurves.standard,
+  );
   late final EffectCleanup _notificationEffect;
-  AppNotification? _currentNotification;
+  AppNotification? _current;
   DateTime? _lastShown;
-  /// Notifications that arrived while one was on screen.
-  ///
-  /// They used to be dropped outright (`if (_controller.isAnimating) return;`),
-  /// and since `_lastShown` was already stamped there was no retry either — so
-  /// two errors inside the 4s dwell window meant the second was never shown.
   final Queue<AppNotification> _pending = Queue();
+  bool _showing = false;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      duration: const Duration(milliseconds: 600),
-      vsync: this,
-    );
-    _offsetAnimation =
-        Tween<Offset>(
-          begin: const Offset(0, -2),
-          end: Offset.zero,
-        ).animate(
-          CurvedAnimation(
-            parent: _controller,
-            curve: Curves.easeOutBack,
-          ),
-        );
-
     _notificationEffect = effect(() {
       final notif = appNotificationSignal.value;
       if (notif == null) return;
       if (_lastShown != null && notif.timestamp.isBefore(_lastShown!)) return;
-
       _lastShown = notif.timestamp;
-
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        unawaited(_showNotification(notif));
+        unawaited(_show(notif));
       });
     });
   }
@@ -111,139 +102,97 @@ class _GlobalNotificationListenerState extends State<GlobalNotificationListener>
     super.dispose();
   }
 
-  Future<void> _showNotification(AppNotification notif) async {
-    // Queue rather than drop: a second error during the dwell window used to
-    // be discarded with no retry.
-    if (_controller.isAnimating) {
+  Future<void> _show(AppNotification notif) async {
+    if (_showing) {
       _pending.add(notif);
       return;
     }
-
-    setState(() {
-      _currentNotification = notif;
-    });
-
-    await _controller.forward();
-    await Future<void>.delayed(const Duration(seconds: 4));
-
+    _showing = true;
+    setState(() => _current = notif);
+    await _controller.forward(from: 0);
+    await Future<void>.delayed(Duration(seconds: notif.isError ? 5 : 3));
     if (!mounted) return;
     await _controller.reverse();
-    // Re-checked after the 600ms reverse: the listener can be disposed while
-    // it plays, and the previous single check happened before it.
     if (!mounted) return;
-    setState(() {
-      _currentNotification = null;
-    });
-
-    if (_pending.isNotEmpty && mounted) {
-      unawaited(_showNotification(_pending.removeFirst()));
-    }
-  }
-
-  @override
-  void dispose() {
-    _notificationEffect();
-    _controller.dispose();
-    _pending.clear();
-    super.dispose();
+    setState(() => _current = null);
+    _showing = false;
+    if (_pending.isNotEmpty) unawaited(_show(_pending.removeFirst()));
   }
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _offsetAnimation,
-      builder: (context, child) {
-        return Stack(
-          alignment: Alignment.topCenter,
-          children: [
-            widget.child,
-            if (_currentNotification != null)
-              Positioned(
-                top: 40,
-                left: 0,
-                right: 0,
-                child: SlideTransition(
-                  position: _offsetAnimation,
-                  child: Center(
-                    child: Material(
-                      color: Colors.transparent,
-                      child: Builder(
-                        builder: (context) {
-                          final cs = Theme.of(context).colorScheme;
-                          final (
-                            bgColor,
-                            fgColor,
-                          ) = switch (_currentNotification!.level) {
-                            AppNotificationLevel.error => (
-                              cs.error,
-                              cs.onError,
-                            ),
-                            AppNotificationLevel.warning => (
-                              cs.tertiary,
-                              cs.onTertiary,
-                            ),
-                            AppNotificationLevel.success => (
-                              cs.primary,
-                              cs.onPrimary,
-                            ),
-                          };
-                          return Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 24,
-                              vertical: 12,
-                            ),
-                            decoration: BoxDecoration(
-                              color: bgColor,
-                              borderRadius: BorderRadius.circular(100),
-                              border: Border.all(
-                                color: cs.onSurface.withValues(alpha: 0.1),
-                              ),
-                              boxShadow: const [
-                                BoxShadow(
-                                  color: Colors.black26,
-                                  blurRadius: 20,
-                                  offset: Offset(0, 10),
-                                ),
-                              ],
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  switch (_currentNotification!.level) {
-                                    AppNotificationLevel.error =>
-                                      Icons.error_outline_rounded,
-                                    AppNotificationLevel.warning =>
-                                      Icons.warning_amber_rounded,
-                                    AppNotificationLevel.success =>
-                                      Icons.check_circle_outline_rounded,
-                                  },
-                                  color: fgColor,
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 12),
-                                Flexible(
-                                  child: Text(
-                                    _currentNotification!.message,
-                                    style: TextStyle(
-                                      color: fgColor,
-                                      fontWeight: FontWeight.w600,
-                                      fontSize: 14,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ),
+    final current = _current;
+    return Stack(
+      alignment: Alignment.topCenter,
+      children: [
+        widget.child,
+        if (current != null)
+          Positioned(
+            top: 16 + MediaQuery.paddingOf(context).top,
+            left: 16,
+            right: 16,
+            child: IgnorePointer(
+              ignoring: false,
+              child: AnimatedBuilder(
+                animation: _curve,
+                builder: (context, child) => Opacity(
+                  opacity: _curve.value,
+                  child: Transform.translate(
+                    offset: Offset(0, (1 - _curve.value) * -12),
+                    child: child,
                   ),
                 ),
+                child: Center(child: _Toast(notification: current, onClose: () => _controller.reverse())),
               ),
-          ],
-        );
-      },
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _Toast extends StatelessWidget {
+  const _Toast({required this.notification, required this.onClose});
+
+  final AppNotification notification;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, color) = switch (notification.level) {
+      AppNotificationLevel.error => (LucideIcons.circleAlert, GColors.destructive),
+      AppNotificationLevel.warning => (LucideIcons.triangleAlert, GColors.brand),
+      AppNotificationLevel.success => (LucideIcons.circleCheck, GColors.brand),
+    };
+    return Semantics(
+      liveRegion: true,
+      child: Material(
+        type: MaterialType.transparency,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+            decoration: BoxDecoration(
+              color: GColors.popover,
+              borderRadius: BorderRadius.circular(GRadius.xl),
+              border: Border.all(color: GColors.border),
+              boxShadow: const [
+                BoxShadow(color: Color(0x55000000), blurRadius: 24, offset: Offset(0, 8)),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: color),
+                const SizedBox(width: 12),
+                Flexible(child: Text(notification.message, style: GText.sm())),
+                const SizedBox(width: 4),
+                GIconButton(icon: LucideIcons.x, size: 14, padding: 6, tooltip: 'Закрыть', onPressed: onClose),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

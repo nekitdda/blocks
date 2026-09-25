@@ -2,21 +2,29 @@ import 'dart:io';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
-import 'package:window_manager/window_manager.dart';
 import 'package:youmuz/src/features/album/views/album_view.dart';
 import 'package:youmuz/src/features/artist/views/artist_view.dart';
+import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
 import 'package:youmuz/src/features/auth/views/yandex_id_view.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
-import 'package:youmuz/src/features/core/views/layout/background.dart';
-import 'package:youmuz/src/features/core/views/layout/navigation_bar.dart';
+import 'package:youmuz/src/features/core/views/layout/account_menu.dart';
+import 'package:youmuz/src/features/core/views/layout/header.dart';
+import 'package:youmuz/src/features/core/views/layout/mobile_player.dart';
 import 'package:youmuz/src/features/core/views/layout/player_bar.dart';
+import 'package:youmuz/src/features/core/views/widgets/lyrics_view.dart';
 import 'package:youmuz/src/features/home/views/home_view.dart';
 import 'package:youmuz/src/features/library/views/library_view.dart';
 import 'package:youmuz/src/features/library/views/playlist_view.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
+import 'package:youmuz/src/features/playback/views/wave_view.dart';
 import 'package:youmuz/src/features/search/views/search_view.dart';
 import 'package:youmuz/src/features/settings/views/settings_view.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
+bool isCompactLayout(BuildContext context) =>
+    Platform.isAndroid || MediaQuery.sizeOf(context).width < GLayout.compactBreakpoint;
+
+/// App shell: header, the page stacks of every tab, and the player.
 class AppLayout extends StatefulWidget {
   const AppLayout({super.key});
 
@@ -25,156 +33,64 @@ class AppLayout extends StatefulWidget {
 }
 
 class _AppLayoutState extends State<AppLayout> {
-  final PageStorageBucket _bucket = PageStorageBucket();
+  PageStorageBucket _bucket = PageStorageBucket();
+  int? _bucketOwner;
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        currentRootSignal();
-        final navState = currentNavStateSignal();
-        final isHome = navState.section == AppSection.home;
-
-        final isDesktop =
-            Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-        final isCustomTitlebar = isDesktop && customTitlebarSignal.value;
-
-        final screenWidth = MediaQuery.sizeOf(context).width;
-        // Use the touch layout for all Android form factors, including
-        // tablets. A large Android screen must not select the desktop navbar.
-        final isNarrow = Platform.isAndroid || screenWidth < 600;
+        final compact = isCompactLayout(context);
+        final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+        final customTitlebar = isDesktop && customTitlebarSignal();
+        final canGoBack = canGoBackSignal();
+        final uid = activeAccountUidSignal();
+        if (uid != _bucketOwner) {
+          // Scroll positions belong to the account they were made in.
+          _bucket = PageStorageBucket();
+          _bucketOwner = uid;
+        }
 
         return PopScope(
-          canPop: !canGoBackSignal.value,
-          onPopInvokedWithResult: (didPop, result) {
-            if (didPop) return;
-            if (canGoBackSignal.value) {
-              goBack();
-            }
+          canPop: !canGoBack,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop && canGoBackSignal.value) goBack();
           },
           child: Scaffold(
-            backgroundColor: Colors.transparent,
+            backgroundColor: GColors.background,
             resizeToAvoidBottomInset: false,
-            body: PageStorage(
-              bucket: _bucket,
+            body: SafeArea(
+              top: !customTitlebar,
+              bottom: false,
               child: Stack(
                 children: [
-                  // 1. Background (shader + blur)
-                  const Positioned.fill(child: BlurredCoverBackground()),
-                  const Positioned.fill(child: WaveBackground()),
-
-                  // 2. Dimming when leaving home or showing lyrics — held
-                  // off while lyrics are still loading or came back empty,
-                  // so nothing is shown over a darkened background in
-                  // either case.
-                  SignalBuilder(
-                    builder: (context) {
-                      final showLyrics = showLyricsSignal.value;
-                      final hideOverlay = hideLyricsOverlaySignal.value;
-                      final suppressDim = lyricsSuppressDimSignal.value;
-                      final isDimmed =
-                          !isHome ||
-                          (showLyrics && !hideOverlay && !suppressDim);
-
-                      return Positioned.fill(
-                        // Isolated: this is a full-window colour animation,
-                        // and without a boundary the dirty flag walked up to
-                        // the app's only root RepaintBoundary — re-rasterising
-                        // the blurred background, the vibe shader, the active
-                        // tab's scroll content and both BackdropFilters on
-                        // every frame of the 500ms transition.
-                        child: RepaintBoundary(
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 500),
-                            color: isDimmed
-                                ? (isHome
-                                      ? Colors.black54
-                                      : Colors.black.withValues(alpha: 0.6))
-                                : Colors.transparent,
+                  Column(
+                    children: [
+                      if (compact) const _MobileHeader() else const GraphiteHeader(),
+                      Expanded(
+                        // Rebuilt per account: no page keeps state of the
+                        // previous session.
+                        child: KeyedSubtree(
+                          key: ValueKey('session_$uid'),
+                          child: PageStorage(
+                            bucket: _bucket,
+                            child: Stack(
+                              children: [
+                                for (final root in rootSections) _RootBucket(root: root),
+                                const _LyricsOverlay(),
+                              ],
+                            ),
                           ),
                         ),
-                      );
-                    },
-                  ),
-
-                  Positioned.fill(
-                    child: SafeArea(
-                      top: !isCustomTitlebar,
-                      bottom: false,
-                      child: Stack(
-                        children: [
-                          // 3. Content (set of independent stacks for each tab)
-                          Positioned.fill(
-                            child: Padding(
-                              padding: EdgeInsets.only(
-                                top: isCustomTitlebar ? 32.0 : 0,
-                              ),
-                              child: Stack(
-                                children: [
-                                  Positioned.fill(
-                                    child: Stack(
-                                      children: rootSections
-                                          .map(
-                                            (root) => _RootBucket(root: root),
-                                          )
-                                          .toList(),
-                                    ),
-                                  ),
-                                  Positioned(
-                                    left: 0,
-                                    right: 0,
-                                    bottom:
-                                        (isNarrow &&
-                                            !(Platform.isAndroid &&
-                                                showLyricsSignal.value))
-                                        ? 80
-                                        : 0,
-                                    child: _AnimatedPlayerBar(isHome: isHome),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-
-                          // 4. Navigation
-                          SignalBuilder(
-                            builder: (context) {
-                              final showLyrics = showLyricsSignal.value;
-                              final isAndroid = Platform.isAndroid;
-                              if (isAndroid && showLyrics) {
-                                return const SizedBox.shrink();
-                              }
-                              return Align(
-                                alignment:
-                                    MediaQuery.sizeOf(context).width < 600
-                                    ? Alignment.bottomCenter
-                                    : Alignment.centerLeft,
-                                child: const FloatingNavBar(),
-                              );
-                            },
-                          ),
-
-                          // 5. Back button
-                          _FloatingBackButton(),
-
-                          // 6. Custom Titlebar
-                          if (isCustomTitlebar)
-                            const Positioned(
-                              top: 0,
-                              left: 0,
-                              right: 0,
-                              child: SizedBox(
-                                height: 32,
-                                child: WindowCaption(
-                                  brightness: Brightness.dark,
-                                  backgroundColor: Colors.transparent,
-                                ),
-                              ),
-                            ),
-                        ],
                       ),
-                    ),
+                      if (compact) ...[
+                        const MobileMiniPlayer(),
+                        const MobileNavBar(),
+                      ] else
+                        const PlayerBar(),
+                    ],
                   ),
+                  const Positioned.fill(child: SessionTransitionOverlay()),
                 ],
               ),
             ),
@@ -185,181 +101,128 @@ class _AppLayoutState extends State<AppLayout> {
   }
 }
 
-class _RootBucket extends StatelessWidget {
-  final AppSection root;
-
-  const _RootBucket({required this.root});
+class _MobileHeader extends StatelessWidget {
+  const _MobileHeader();
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final activeRoot = currentRootSignal.value;
-        final stack = rootStacksSignal.value[root] ?? [NavState(root)];
-        final isVisible = activeRoot == root;
+        final canGoBack = canGoBackSignal();
+        return SizedBox(
+          height: 56,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                if (canGoBack) ...[
+                  GCircleButton(
+                    icon: LucideIcons.chevronLeft,
+                    size: 34,
+                    tooltip: 'Назад',
+                    onPressed: goBack,
+                  ),
+                  const SizedBox(width: 12),
+                ],
+                const GraphiteLogo(),
+                const Spacer(),
+                GIconButton(
+                  icon: LucideIcons.settings,
+                  size: 18,
+                  tooltip: 'Настройки',
+                  onPressed: () => navigateTo(AppSection.account),
+                ),
+                const SizedBox(width: 8),
+                const AccountMenuButton(size: 30),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
 
-        if (root == AppSection.account && !isVisible) {
-          return const SizedBox.shrink();
-        }
+class _RootBucket extends StatelessWidget {
+  const _RootBucket({required this.root});
+
+  final AppSection root;
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final activeRoot = currentRootSignal();
+        final stack = rootStacksSignal()[root] ?? [NavState(root)];
+        final isVisible = activeRoot == root;
 
         return Offstage(
           offstage: !isVisible,
           child: TickerMode(
             enabled: isVisible,
             child: Stack(
-              children: _buildWindowStack(stack),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  List<Widget> _buildWindowStack(List<NavState> stack) {
-    return stack.asMap().entries.map((entry) {
-      final index = entry.key;
-      final state = entry.value;
-      final isLast = index == stack.length - 1;
-      final isHome = state.section == AppSection.home;
-
-      // Keep only the current and previous screens in the tab stack
-      final isDeeplyHidden = index < stack.length - 2;
-
-      return Offstage(
-        key: ValueKey('win_${state.section}_${state.id}_$index'),
-        offstage: isDeeplyHidden,
-        child: TickerMode(
-          enabled: !isDeeplyHidden,
-          child: AnimatedOpacity(
-            duration: const Duration(milliseconds: 500),
-            opacity: isLast ? 1.0 : 0.0,
-            curve: Curves.easeInOutCubic,
-            child: AnimatedSlide(
-              duration: const Duration(milliseconds: 500),
-              offset: isLast
-                  ? Offset.zero
-                  : (isHome ? const Offset(0, -0.05) : const Offset(0.03, 0)),
-              curve: Curves.easeOutCubic,
-              child: AnimatedScale(
-                duration: const Duration(milliseconds: 500),
-                scale: isLast ? 1.0 : 0.98,
-                curve: Curves.easeOutCubic,
-                child: IgnorePointer(
-                  ignoring: !isLast,
-                  child: _WindowContent(state: state, index: index),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-    }).toList();
-  }
-}
-
-class _AnimatedPlayerBar extends StatelessWidget {
-  final bool isHome;
-
-  const _AnimatedPlayerBar({required this.isHome});
-
-  @override
-  Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final showLyrics = showLyricsSignal.value;
-        final shouldShowBar = !isHome || showLyrics;
-
-        return AnimatedSwitcher(
-          duration: const Duration(milliseconds: 600),
-          reverseDuration: const Duration(milliseconds: 500),
-          switchInCurve: Curves.easeOutCubic,
-          switchOutCurve: Curves.easeInCubic,
-          transitionBuilder: (child, animation) {
-            final offsetAnimation = Tween<Offset>(
-              begin: const Offset(0, 1),
-              end: Offset.zero,
-            ).animate(animation);
-            final opacityAnimation = Platform.isAndroid
-                ? Tween<double>(begin: 0, end: 1).animate(
-                    CurvedAnimation(
-                      parent: animation,
-                      curve: const Interval(0, 0.6, curve: Curves.easeIn),
+              children: [
+                for (var i = 0; i < stack.length; i++)
+                  // Only the top page and the one below stay mounted.
+                  if (i >= stack.length - 2)
+                    _PageLayer(
+                      key: ValueKey('page_${stack[i].section}_${stack[i].id}_$i'),
+                      state: stack[i],
+                      index: i,
+                      isTop: i == stack.length - 1,
                     ),
-                  )
-                : animation;
-            return SlideTransition(
-              position: offsetAnimation,
-              child: FadeTransition(
-                opacity: opacityAnimation,
-                child: child,
-              ),
-            );
-          },
-          child: shouldShowBar
-              ? const PlayerBar(
-                  key: ValueKey('player_bar_visible'),
-                )
-              : const SizedBox.shrink(key: ValueKey('player_bar_hidden')),
+              ],
+            ),
+          ),
         );
       },
     );
   }
 }
 
-class _WindowContent extends StatelessWidget {
+/// One page in a tab stack. The top page fades in with a short slide; the
+/// page below stays mounted (instant back) but hidden and inert.
+class _PageLayer extends StatelessWidget {
+  const _PageLayer({
+    required this.state,
+    required this.index,
+    required this.isTop,
+    super.key,
+  });
+
   final NavState state;
   final int index;
-
-  const _WindowContent({required this.state, required this.index});
+  final bool isTop;
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final isHome = state.section == AppSection.home;
-        final showLyrics = showLyricsSignal.value;
-        final screenWidth = MediaQuery.sizeOf(context).width;
-        final isNarrow = Platform.isAndroid || screenWidth < 600;
-
-        // Bottom padding calculation to avoid overlap with PlayerBar and NavBar
-        // We only apply it to the browser (yandexId) and settings (account) to prevent them from being covered,
-        // while other views scroll under the player for the blur effect.
-        final hasPlayerBar = !isHome || showLyrics;
-
-        double bottomPadding = 0;
-        if (state.section == AppSection.yandexId ||
-            state.section == AppSection.account) {
-          if (isNarrow) {
-            bottomPadding = hasPlayerBar ? 180 : 96;
-          } else {
-            bottomPadding = hasPlayerBar ? 116 : 0;
-          }
-        }
-
-        final key = state.section == AppSection.account
-            ? ValueKey('account_$index')
-            : PageStorageKey('scroll_${state.section}_${state.id}_$index');
-
-        final child = KeyedSubtree(
-          key: key,
-          child: _mapSectionToWidget(context, state),
-        );
-
-        return Padding(
-          padding: EdgeInsets.only(
-            left: (isHome || isNarrow) ? 0 : 96,
-            bottom: bottomPadding,
+    return IgnorePointer(
+      ignoring: !isTop,
+      child: ExcludeFocus(
+        excluding: !isTop,
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: isTop ? 0 : 1, end: isTop ? 1 : 0),
+          duration: GDurations.medium,
+          curve: GCurves.emphasized,
+          builder: (context, t, child) => Opacity(
+            opacity: t,
+            child: Transform.translate(offset: Offset(0, (1 - t) * 8), child: child),
           ),
-          child: child,
-        );
-      },
+          child: KeyedSubtree(
+            key: PageStorageKey('scroll_${state.section}_${state.id}_$index'),
+            child: _sectionView(state),
+          ),
+        ),
+      ),
     );
   }
 
-  Widget _mapSectionToWidget(BuildContext context, NavState state) {
+  Widget _sectionView(NavState state) {
     switch (state.section) {
       case AppSection.home:
         return const HomeView();
+      case AppSection.wave:
+        return const WaveView();
       case AppSection.search:
         return const SearchView();
       case AppSection.liked:
@@ -370,61 +233,63 @@ class _WindowContent extends StatelessWidget {
       case AppSection.artist:
         return ArtistView(artistId: state.id);
       case AppSection.playlist:
-        final parts = state.id?.split(':') ?? [];
+        final parts = state.id?.split(':') ?? const <String>[];
         return PlaylistView(
           uid: parts.isNotEmpty ? parts[0] : null,
           kind: parts.length > 1 ? parts[1] : null,
         );
-      case AppSection.wave:
-        return Center(
-          child: Text(
-            'Волна',
-            style: TextStyle(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-        );
       case AppSection.account:
         return const SettingsView();
       case AppSection.yandexId:
-        return const YandexIdView();
+        return const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: YandexIdView(),
+        );
     }
   }
 }
 
-class _FloatingBackButton extends StatelessWidget {
+/// Synced lyrics over the content area (toggled from the player).
+class _LyricsOverlay extends StatelessWidget {
+  const _LyricsOverlay();
+
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        if (!canGoBackSignal.value) return const SizedBox.shrink();
-
-        return Positioned(
-          top: 60,
-          left: 24,
-          child: IconButton(
-            onPressed: goBack,
-            style: IconButton.styleFrom(
-              backgroundColor: Color.lerp(
-                Theme.of(context).colorScheme.surfaceContainerHighest,
-                Colors.black,
-                0.4,
-              ),
-              hoverColor: Theme.of(
-                context,
-              ).colorScheme.onSurface.withValues(alpha: 0.1),
-              padding: const EdgeInsets.all(12),
-              side: BorderSide(
-                color: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.1),
-              ),
-            ),
-            icon: Icon(
-              Icons.arrow_back_ios_new_rounded,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-              size: 24,
-            ),
+        final trackId = currentTrackIdSignal();
+        final visible = showLyricsSignal() && trackId != null;
+        return IgnorePointer(
+          ignoring: !visible,
+          child: AnimatedOpacity(
+            duration: GDurations.medium,
+            curve: GCurves.standard,
+            opacity: visible ? 1 : 0,
+            child: visible
+                ? ColoredBox(
+                    color: GColors.background,
+                    child: Stack(
+                      children: [
+                        Positioned.fill(
+                          child: GPageFrame(
+                            maxWidth: 960,
+                            padding: const EdgeInsets.fromLTRB(32, 8, 32, 0),
+                            child: LyricsWidget(trackId: trackId, visible: visible),
+                          ),
+                        ),
+                        Positioned(
+                          top: 8,
+                          right: 24,
+                          child: GCircleButton(
+                            icon: LucideIcons.x,
+                            tooltip: 'Закрыть текст',
+                            onPressed: () => showLyricsSignal.value = false,
+                          ),
+                        ),
+                      ],
+                    ),
+                  )
+                : const SizedBox.shrink(),
           ),
         );
       },

@@ -1,272 +1,105 @@
+import 'dart:async';
 import 'dart:io';
-import 'dart:ui' as ui;
 
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
-import 'package:youmuz/src/features/core/providers/visual_effects_provider.dart';
-import 'package:youmuz/src/features/core/theme/app_tokens.dart';
-import 'package:youmuz/src/features/core/views/layout/mobile_mini_player.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
+import 'package:youmuz/src/features/core/views/layout/queue_panel.dart';
 import 'package:youmuz/src/features/core/views/widgets/quality_selector.dart';
-import 'package:youmuz/src/features/core/views/widgets/rust_cached_image.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_elements.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_actions.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_row.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
+/// Desktop player (`rounded-2xl bg-card px-4 py-2.5 gap-6`): track, transport,
+/// waveform seek bar, then like / queue and the remaining controls.
 class PlayerBar extends StatelessWidget {
   const PlayerBar({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final theme = Theme.of(context);
-        final colorScheme = theme.colorScheme;
-        final navState = currentNavStateSignal.value;
-        final showLyrics = showLyricsSignal.value;
-        final isHome = navState.section == AppSection.home;
-
-        final useLyricsStyle = isHome && showLyrics;
-        final alpha = useLyricsStyle ? 0.5 : 0.9;
-        final blur = useLyricsStyle ? 0.0 : 2.0;
-
-        // Dynamic background color based on theme
-        final barColor =
-            Color.lerp(
-              colorScheme.surfaceContainerHighest,
-              Colors.black,
-              0.4,
-            ) ??
-            colorScheme.surface;
-
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final width = constraints.maxWidth;
-            if (width < 600) {
-              return const MobileMiniPlayer();
-            }
-
-            final accentColor = colorScheme.primary;
-            double coverSize = 75;
-            double volumeWidth = 120;
-
-            if (width < 1100) {
-              coverSize = 64;
-              volumeWidth = 100;
-            }
-            if (width < 900) {
-              coverSize = 56;
-              volumeWidth = 80;
-            }
-            if (width < 750) {
-              coverSize = 48;
-              volumeWidth = 60;
-            }
-
-            return AnimatedContainer(
-              duration: const Duration(milliseconds: 600),
-              height: 100,
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              decoration: BoxDecoration(
-                color: barColor.withValues(alpha: alpha),
-                borderRadius: BorderRadius.circular(AppRadius.xl),
-                border: Border.all(
-                  color: colorScheme.onSurface.withValues(alpha: 0.08),
-                ),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(AppRadius.xl),
-                child: BackdropFilter(
-                  enabled: blurEffectsEnabledSignal.value && blur > 0,
-                  filter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        flex: 3,
-                        child: _TrackInfo(coverSize: coverSize),
-                      ),
-                      Expanded(
-                        flex: 4,
-                        child: _PlayerControls(accentColor: accentColor),
-                      ),
-                      Expanded(
-                        flex: 3,
-                        child: _VolumeAndQuality(
-                          accentColor: accentColor,
-                          volumeWidth: volumeWidth,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
+    final width = MediaQuery.sizeOf(context).width;
+    final roomy = width >= 1180;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        decoration: BoxDecoration(
+          color: GColors.card,
+          borderRadius: BorderRadius.circular(GRadius.x2l),
+        ),
+        child: Row(
+          children: [
+            SizedBox(width: roomy ? 256 : 208, child: const _NowPlaying()),
+            const SizedBox(width: 24),
+            const _Transport(),
+            const SizedBox(width: 24),
+            const Expanded(child: _SeekBar()),
+            const SizedBox(width: 24),
+            _Extras(roomy: roomy),
+          ],
+        ),
+      ),
     );
   }
 }
 
-class _TrackInfo extends StatefulWidget {
-  final double coverSize;
-  const _TrackInfo({required this.coverSize});
-
-  @override
-  State<_TrackInfo> createState() => _TrackInfoState();
-}
-
-class _TrackInfoState extends State<_TrackInfo> {
-  final ValueNotifier<bool> _isTitleHovered = ValueNotifier(false);
-  final ValueNotifier<bool> _isCoverHovered = ValueNotifier(false);
-
-  @override
-  void dispose() {
-    _isTitleHovered.dispose();
-    _isCoverHovered.dispose();
-    super.dispose();
-  }
+class _NowPlaying extends StatelessWidget {
+  const _NowPlaying();
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
         final meta = trackMetadataSignal();
-        final isPlaying = isPlayingSignal();
-        if (meta.id == null) return const SizedBox();
-        final cs = Theme.of(context).colorScheme;
-
-        final hasAlbum = meta.albumId != null;
+        final hasTrack = meta.id != null;
+        final albumId = meta.albumId;
+        void openAlbum() {
+          if (albumId != null && albumId.isNotEmpty) navigateTo(AppSection.album, albumId);
+        }
 
         return Row(
           children: [
-            MouseRegion(
-              cursor: hasAlbum
-                  ? SystemMouseCursors.click
-                  : SystemMouseCursors.basic,
-              onEnter: (_) => _isCoverHovered.value = true,
-              onExit: (_) => _isCoverHovered.value = false,
-              child: GestureDetector(
-                onTap: () {
-                  if (hasAlbum) {
-                    navigateTo(AppSection.album, meta.albumId);
-                  }
-                },
-                child: AnimatedScale(
-                  scale: isPlaying ? 1.0 : 0.96,
-                  duration: const Duration(milliseconds: 350),
-                  curve: Curves.easeInOutCubic,
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 400),
-                    child: ClipRRect(
-                      key: ValueKey(meta.coverUrl),
-                      borderRadius: BorderRadius.circular(AppRadius.sm),
-                      child: Stack(
-                        children: [
-                            if (meta.coverUrl != null)
-                              RustCachedImage(
-                                imageUrl: meta.coverUrl,
-                                width: widget.coverSize,
-                                height: widget.coverSize,
-                                errorWidget: Container(
-                                  width: widget.coverSize,
-                                  height: widget.coverSize,
-                                  color: cs.onSurface.withValues(alpha: 0.1),
-                                ),
-                              )
-                            else
-                              Container(
-                                width: widget.coverSize,
-                                height: widget.coverSize,
-                                color: cs.onSurface.withValues(alpha: 0.1),
-                              ),
-                            if (hasAlbum)
-                              Positioned.fill(
-                                child: ValueListenableBuilder<bool>(
-                                  valueListenable: _isCoverHovered,
-                                  builder: (context, hovered, _) {
-                                    return AnimatedOpacity(
-                                      duration: const Duration(
-                                        milliseconds: 150,
-                                      ),
-                                      opacity: hovered ? 1 : 0,
-                                      child: Container(
-                                        color: Colors.black.withValues(
-                                          alpha: 0.45,
-                                        ),
-                                        alignment: Alignment.center,
-                                        child: Icon(
-                                          Icons.album_rounded,
-                                          color: cs.onSurface,
-                                          size: 24,
-                                        ),
-                                      ),
-                                    );
-                                  },
-                                ),
-                              ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
+            GPressable(
+              onTap: hasTrack ? openAlbum : null,
+              focusable: false,
+              builder: (context, s) => AnimatedOpacity(
+                duration: GDurations.fast,
+                opacity: s.hovered ? 0.8 : 1,
+                child: GCover(url: meta.coverUrl, size: 44),
               ),
             ),
-            const SizedBox(width: 16),
+            const SizedBox(width: 12),
             Expanded(
               child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
+                mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Flexible(
-                        child: MouseRegion(
-                          onEnter: (_) => _isTitleHovered.value = true,
-                          onExit: (_) => _isTitleHovered.value = false,
-                          cursor: meta.albumId != null
-                              ? SystemMouseCursors.click
-                              : SystemMouseCursors.basic,
-                          child: ValueListenableBuilder<bool>(
-                            valueListenable: _isTitleHovered,
-                            builder: (context, hovered, _) {
-                              return GestureDetector(
-                                onTap: () {
-                                  if (meta.albumId != null) {
-                                    navigateTo(AppSection.album, meta.albumId);
-                                  }
-                                },
-                                child: Text(
-                                  meta.title,
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.w800,
-                                    fontSize: 17,
-                                    height: 1.15,
-                                    letterSpacing: -0.4,
-                                    decoration: hovered && meta.albumId != null
-                                        ? TextDecoration.underline
-                                        : null,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                      ),
-                      TrackVersionWidget(
-                        version: meta.version,
-                        fontSize: 12,
-                      ),
-                    ],
+                  GPressable(
+                    onTap: hasTrack ? openAlbum : null,
+                    focusable: false,
+                    builder: (context, s) => Text(
+                      hasTrack
+                          ? ((meta.version?.isNotEmpty ?? false) ? '${meta.title} (${meta.version})' : meta.title)
+                          : 'Ничего не играет',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GText.sm(
+                        weight: GText.medium,
+                        color: hasTrack ? GColors.foreground : GColors.mutedForeground,
+                      ).copyWith(decoration: s.hovered ? TextDecoration.underline : null),
+                    ),
                   ),
-                  ArtistNamesWidget(
-                    artists: meta.artists,
-                    maxLines: 1,
-                  ),
+                  if (hasTrack)
+                    ArtistLinks(artists: meta.artists)
+                  else
+                    Text(
+                      'Выберите трек или запустите волну',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GText.xs(color: GColors.mutedForeground),
+                    ),
                 ],
               ),
             ),
@@ -277,141 +110,34 @@ class _TrackInfoState extends State<_TrackInfo> {
   }
 }
 
-class _PlayerControls extends StatelessWidget {
-  final Color accentColor;
-  const _PlayerControls({required this.accentColor});
+class _Transport extends StatelessWidget {
+  const _Transport();
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final trackId = trackMetadataSignal().id;
-        final isPlaying = isPlayingSignal();
-        final isLiked = isLikedSignal();
-        final isDisliked = isDislikedSignal();
-        final isShuffled = isShuffledSignal();
-        final repeatMode = repeatModeSignal();
-        final showBuffering = showBufferingIndicatorSignal.value;
-        final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
-
-        var repeatIcon = Icons.repeat;
-        if (repeatMode == RepeatModeDto.single) {
-          repeatIcon = Icons.repeat_one;
-        }
-
-        return Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+        final hasTrack = currentTrackIdSignal() != null;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: Center(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: Icon(
-                          Icons.lyrics_rounded,
-                          size: 20,
-                          color: showLyricsSignal.value
-                              ? accentColor
-                              : onSurfaceVariant,
-                        ),
-                        onPressed: () =>
-                            showLyricsSignal.value = !showLyricsSignal.value,
-                      ),
-                      IconButton(
-                        icon: Icon(
-                          Icons.shuffle,
-                          size: 20,
-                          color: isShuffled ? accentColor : onSurfaceVariant,
-                        ),
-                        onPressed: PlaybackController.toggleShuffle,
-                      ),
-                      IconButton(
-                        icon: Icon(
-                          isDisliked
-                              ? Icons.heart_broken
-                              : Icons.heart_broken_outlined,
-                          size: 20,
-                          color: isDisliked
-                              ? Colors.blueGrey
-                              : onSurfaceVariant,
-                        ),
-                        onPressed: () => trackId != null
-                            ? PlaybackController.toggleDislike(trackId: trackId)
-                            : null,
-                      ),
-                      const IconButton(
-                        icon: Icon(Icons.skip_previous_rounded, size: 28),
-                        onPressed: PlaybackController.prev,
-                      ),
-                      IconButton(
-                        iconSize: 48,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(
-                          minWidth: 48,
-                          minHeight: 48,
-                        ),
-                        icon: showBuffering
-                            ? M3ECircularWavyProgressIndicator(
-                                strokeWidth: 3,
-                                size: 40,
-                                color: accentColorSignal.value,
-                              )
-                            : AnimatedSwitcher(
-                                duration: const Duration(milliseconds: 250),
-                                switchInCurve: Curves.easeOutBack,
-                                switchOutCurve: Curves.easeIn,
-                                transitionBuilder: (child, animation) {
-                                  return FadeTransition(
-                                    opacity: animation,
-                                    child: ScaleTransition(
-                                      scale: animation,
-                                      child: child,
-                                    ),
-                                  );
-                                },
-                                child: Icon(
-                                  isPlaying
-                                      ? Icons.pause_circle_filled_rounded
-                                      : Icons.play_circle_filled_rounded,
-                                  key: ValueKey<bool>(isPlaying),
-                                ),
-                              ),
-                        onPressed: PlaybackController.togglePlay,
-                      ),
-                      const IconButton(
-                        icon: Icon(Icons.skip_next_rounded, size: 28),
-                        onPressed: PlaybackController.next,
-                      ),
-                      AnimatedLikeButton(
-                        isLiked: isLiked,
-                        size: 20,
-                        onTap: trackId != null
-                            ? () => PlaybackController.toggleLike(
-                                trackId: trackId,
-                              )
-                            : null,
-                      ),
-                      IconButton(
-                        icon: Icon(
-                          repeatIcon,
-                          size: 20,
-                          color: repeatMode != RepeatModeDto.none
-                              ? accentColor
-                              : onSurfaceVariant,
-                        ),
-                        onPressed: PlaybackController.toggleRepeat,
-                      ),
-                      CommonQualitySelector(accentColor: accentColor),
-                    ],
-                  ),
-                ),
-              ),
+            GIconButton(
+              glyph: GGlyphKind.skipBack,
+              tooltip: 'Предыдущий трек',
+              onPressed: hasTrack ? () => unawaited(PlaybackController.prev()) : null,
             ),
-            CommonProgressSlider(accentColor: accentColor, compact: true),
-            const SizedBox(height: 6),
+            const SizedBox(width: 4),
+            GPlayButton(
+              isPlaying: isPlayingSignal(),
+              loading: showBufferingIndicatorSignal(),
+              onPressed: hasTrack ? () => unawaited(PlaybackController.togglePlay()) : null,
+            ),
+            const SizedBox(width: 4),
+            GIconButton(
+              glyph: GGlyphKind.skipForward,
+              tooltip: 'Следующий трек',
+              onPressed: hasTrack ? () => unawaited(PlaybackController.next()) : null,
+            ),
           ],
         );
       },
@@ -419,40 +145,186 @@ class _PlayerControls extends StatelessWidget {
   }
 }
 
-class _VolumeAndQuality extends StatelessWidget {
-  final Color accentColor;
-  final double volumeWidth;
-  const _VolumeAndQuality({
-    required this.accentColor,
-    required this.volumeWidth,
-  });
+class _SeekBar extends StatelessWidget {
+  const _SeekBar();
 
   @override
   Widget build(BuildContext context) {
-    final showVolume = !Platform.isAndroid;
-    final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
-
-    return FittedBox(
-      fit: BoxFit.scaleDown,
-      alignment: Alignment.centerRight,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: [
-          if (showVolume) ...[
-            Icon(
-              Icons.volume_up_rounded,
-              size: 18,
-              color: onSurfaceVariant,
+    return SignalBuilder(
+      builder: (context) {
+        final id = currentTrackIdSignal();
+        final p = trackProgressSignal();
+        final duration = id == null ? 0.0 : p.durationMs;
+        final position = id == null ? 0.0 : p.positionMs;
+        final ratio = duration > 0 ? (position / duration).clamp(0.0, 1.0) : 0.0;
+        return Row(
+          children: [
+            SizedBox(
+              width: 40,
+              child: Text(
+                formatDuration(position.round()),
+                textAlign: TextAlign.right,
+                style: GText.time(),
+              ),
             ),
-            CommonVolumeSlider(
-              width: volumeWidth,
-              activeColor: accentColor,
+            const SizedBox(width: 12),
+            Expanded(
+              child: GWaveform(
+                seed: id ?? 'idle',
+                progress: ratio,
+                onSeek: id == null || duration <= 1
+                    ? null
+                    : (r) => unawaited(
+                        PlaybackController.seekTo(Duration(milliseconds: (r * duration).round())),
+                      ),
+              ),
             ),
-            const SizedBox(width: 8),
-            const AudioDeviceButton(),
+            const SizedBox(width: 12),
+            SizedBox(
+              width: 40,
+              child: Text(formatDuration(duration <= 1 ? 0 : duration.round()), style: GText.time()),
+            ),
           ],
-        ],
-      ),
+        );
+      },
+    );
+  }
+}
+
+class _Extras extends StatelessWidget {
+  const _Extras({required this.roomy});
+
+  final bool roomy;
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final trackId = currentTrackIdSignal();
+        final hasTrack = trackId != null;
+        final repeat = repeatModeSignal();
+        final lyricsOn = showLyricsSignal();
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            GIconButton(
+              glyph: GGlyphKind.heart,
+              active: isLikedSignal(),
+              tooltip: isLikedSignal() ? 'Убрать из понравившихся' : 'Нравится',
+              onPressed: hasTrack ? () => unawaited(PlaybackController.toggleLike(trackId: trackId)) : null,
+            ),
+            GIconButton(
+              icon: LucideIcons.ban,
+              active: isDislikedSignal(),
+              tooltip: 'Не рекомендовать',
+              onPressed: hasTrack ? () => unawaited(PlaybackController.toggleDislike(trackId: trackId)) : null,
+            ),
+            GIconButton(
+              icon: LucideIcons.shuffle,
+              active: isShuffledSignal(),
+              tooltip: 'Перемешать',
+              onPressed: () => unawaited(PlaybackController.toggleShuffle()),
+            ),
+            GIconButton(
+              icon: repeat == RepeatModeDto.single ? LucideIcons.repeat1 : LucideIcons.repeat,
+              active: repeat != RepeatModeDto.none,
+              tooltip: switch (repeat) {
+                RepeatModeDto.none => 'Повтор выключен',
+                RepeatModeDto.all => 'Повторять очередь',
+                RepeatModeDto.single => 'Повторять трек',
+              },
+              onPressed: () => unawaited(PlaybackController.toggleRepeat()),
+            ),
+            GIconButton(
+              icon: LucideIcons.micVocal,
+              active: lyricsOn,
+              tooltip: 'Текст песни',
+              onPressed: hasTrack ? () => showLyricsSignal.value = !lyricsOn : null,
+            ),
+            GIconButton(
+              icon: LucideIcons.listMusic,
+              tooltip: 'Очередь',
+              onPressed: () => unawaited(showQueuePanel(context)),
+            ),
+            if (!Platform.isAndroid) ...[
+              const SizedBox(width: 4),
+              _Volume(width: roomy ? 96 : 64),
+            ],
+            const SizedBox(width: 4),
+            const CommonQualitySelector(),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Volume icon (click mutes/restores) and a thin slider.
+class _Volume extends StatefulWidget {
+  const _Volume({required this.width});
+
+  final double width;
+
+  @override
+  State<_Volume> createState() => _VolumeState();
+}
+
+class _VolumeState extends State<_Volume> {
+  double? _drag;
+  int _beforeMute = 70;
+
+  void _set(int v) {
+    unawaited(PlaybackController.changeVolume(v));
+    unawaited(PlaybackController.commitVolume());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final volume = playerVolumeSignal();
+        final shown = _drag ?? volume.toDouble();
+        final muted = shown <= 0;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            GIconButton(
+              icon: muted ? LucideIcons.volumeX : LucideIcons.volume2,
+              tooltip: muted ? 'Включить звук' : 'Выключить звук',
+              onPressed: () {
+                if (muted) {
+                  _set(_beforeMute <= 0 ? 70 : _beforeMute);
+                } else {
+                  _beforeMute = volume;
+                  _set(0);
+                }
+              },
+            ),
+            SizedBox(
+              width: widget.width,
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5, elevation: 0, pressedElevation: 0),
+                  trackHeight: 3,
+                ),
+                child: Slider(
+                  value: shown.clamp(0, 100),
+                  max: 100,
+                  semanticFormatterCallback: (v) => 'Громкость ${v.round()}%',
+                  onChanged: (v) {
+                    setState(() => _drag = v);
+                    unawaited(PlaybackController.changeVolume(v.round()));
+                  },
+                  onChangeEnd: (_) {
+                    setState(() => _drag = null);
+                    unawaited(PlaybackController.commitVolume());
+                  },
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

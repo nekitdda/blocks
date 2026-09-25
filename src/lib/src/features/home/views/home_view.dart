@@ -1,576 +1,325 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
-import 'package:youmuz/src/features/core/views/widgets/home_cover_widget.dart';
-import 'package:youmuz/src/features/core/views/widgets/lyrics_view.dart';
-import 'package:youmuz/src/features/core/views/widgets/quality_selector.dart';
-import 'package:youmuz/src/features/core/views/widgets/responsive.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_elements.dart';
+import 'package:youmuz/src/features/core/services/rust_bridge.dart';
+import 'package:youmuz/src/features/core/views/widgets/media_tile.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_actions.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_row.dart';
+import 'package:youmuz/src/features/library/providers/library_provider.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
-import 'package:youmuz/src/features/playback/views/wave_view.dart';
+import 'package:youmuz/src/features/playback/providers/wave_provider.dart';
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/rust/api/playback.dart' as rust_playback;
+import 'package:youmuz/src/ui/ui.dart';
 
-class HomeView extends StatelessWidget {
+String greeting([DateTime? now]) {
+  final h = (now ?? DateTime.now()).hour;
+  if (h < 5) return 'Доброй ночи';
+  if (h < 12) return 'Доброе утро';
+  if (h < 18) return 'Добрый день';
+  return 'Добрый вечер';
+}
+
+/// Recently played tracks of the active account (persisted per account).
+final FlutterSignal<List<SimpleTrackDto>> recentTracksSignal = signal(const []);
+
+Future<void> refreshRecentTracks() async {
+  final tracks = await runRustFetch((ctx) => rust_playback.getHistory(ctx: ctx, limit: 12));
+  if (tracks != null) recentTracksSignal.value = tracks;
+}
+
+/// Home: greeting, "Моя волна" card with the user's playlists, playlist
+/// covers, recently played tracks and albums from the collection.
+class HomeView extends StatefulWidget {
   const HomeView({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        return SignalBuilder(
-          builder: (context) {
-            final height = constraints.maxHeight;
-            final width = constraints.maxWidth;
-            final showLyrics = showLyricsSignal.value;
-
-            var verticalSpacing = 40.0;
-            var trackHeaderSpacing = 32.0;
-            var controlsSpacing = 32.0;
-
-            // Adaptation for height
-            if (height < 800) {
-              verticalSpacing = 24.0;
-              trackHeaderSpacing = 24.0;
-              controlsSpacing = 24.0;
-            }
-            if (height < 650) {
-              verticalSpacing = 16.0;
-              trackHeaderSpacing = 16.0;
-              controlsSpacing = 16.0;
-            }
-
-            final isNarrow = context.isNarrow;
-
-            return Stack(
-              children: [
-                Positioned.fill(
-                  child: Stack(
-                    children: [
-                      // Left side: Player UI
-                      AnimatedPositioned(
-                        duration: const Duration(milliseconds: 350),
-                        curve: Curves.easeInOutCubic,
-                        left: showLyrics ? -width : 0,
-                        right: showLyrics ? width : 0,
-                        top: 0,
-                        bottom: 0,
-                        child: Center(
-                          child: Padding(
-                            padding: EdgeInsets.symmetric(
-                              horizontal: isNarrow ? 24 : 24,
-                              vertical: 12,
-                            ),
-                            child: isNarrow && !showLyrics
-                                ? Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      const Center(child: HomeCoverWidget()),
-                                      SizedBox(height: verticalSpacing * 1.5),
-                                      _HomeTrackHeader(
-                                        small: height < 750,
-                                        isNarrow: true,
-                                      ),
-                                      const SizedBox(
-                                        height: 8,
-                                      ), // Reduced from trackHeaderSpacing
-                                      SizedBox(
-                                        width: width - 48,
-                                        child: CommonProgressSlider(
-                                          maxWidth: width - 48,
-                                        ),
-                                      ),
-                                      const SizedBox(
-                                        height: 12,
-                                      ), // Reduced from controlsSpacing
-                                      _HomeMainControls(
-                                        showLyrics: showLyrics,
-                                        small: height < 750,
-                                        isNarrow: true,
-                                      ),
-                                    ],
-                                  )
-                                : FittedBox(
-                                    fit: BoxFit.scaleDown,
-                                    child: Column(
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.center,
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        const HomeCoverWidget(),
-                                        SizedBox(height: verticalSpacing),
-                                        _HomeTrackHeader(small: height < 750),
-                                        SizedBox(height: trackHeaderSpacing),
-                                        const SizedBox(
-                                          width: 500,
-                                          child: CommonProgressSlider(
-                                            maxWidth: 500,
-                                          ),
-                                        ),
-                                        SizedBox(height: controlsSpacing),
-                                        _HomeMainControls(
-                                          showLyrics: showLyrics,
-                                          small: height < 750,
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                          ),
-                        ),
-                      ),
-
-                      // Right side: Lyrics
-                      AnimatedPositioned(
-                        duration: const Duration(milliseconds: 350),
-                        curve: Curves.easeInOutCubic,
-                        left: showLyrics ? 0 : width,
-                        right: showLyrics ? 0 : -width,
-                        top: 0,
-                        bottom: 0,
-                        child: Container(
-                          padding: EdgeInsets.only(
-                            left: Platform.isAndroid ? 20 : 60,
-                            right: Platform.isAndroid ? 20 : 60,
-                            top: Platform.isAndroid ? 20 : 40,
-                            bottom: Platform.isAndroid ? 100 : 40,
-                          ),
-                          child: Stack(
-                            children: [
-                              Positioned.fill(
-                                child: SignalBuilder(
-                                  builder: (context) {
-                                    final trackId = trackMetadataSignal().id;
-                                    if (trackId == null) {
-                                      return Center(
-                                        child: Text(
-                                          'Выберите трек',
-                                          style: TextStyle(
-                                            color: Theme.of(
-                                              context,
-                                            ).colorScheme.onSurfaceVariant,
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                    return LyricsWidget(
-                                      trackId: trackId,
-                                      visible: showLyrics,
-                                    );
-                                  },
-                                ),
-                              ),
-                              if (Platform.isAndroid)
-                                Positioned(
-                                  top: 10,
-                                  left: 0,
-                                  child: SafeArea(
-                                    child: IconButton(
-                                      icon: Icon(
-                                        Icons.arrow_back_ios_new_rounded,
-                                        color: Theme.of(
-                                          context,
-                                        ).colorScheme.onSurfaceVariant,
-                                        size: 24,
-                                      ),
-                                      onPressed: () {
-                                        showLyricsSignal.value = false;
-                                      },
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
+  State<HomeView> createState() => _HomeViewState();
 }
 
-class _HomeTrackHeader extends StatefulWidget {
-  final bool small;
-  final bool isNarrow;
-  const _HomeTrackHeader({required this.small, this.isNarrow = false});
+class _HomeViewState extends State<HomeView> {
+  EffectCleanup? _historySync;
 
   @override
-  State<_HomeTrackHeader> createState() => _HomeTrackHeaderState();
-}
-
-class _HomeTrackHeaderState extends State<_HomeTrackHeader> {
-  final ValueNotifier<bool> _isTitleHovered = ValueNotifier(false);
+  void initState() {
+    super.initState();
+    recentTracksSignal.value = const [];
+    unawaited(refreshLikedTracks());
+    unawaited(refreshLikedAlbums());
+    // New entries land in the history once a track starts playing.
+    _historySync = effect(() {
+      currentTrackIdSignal();
+      isPlayingSignal();
+      Future<void>.delayed(const Duration(milliseconds: 800), refreshRecentTracks);
+    });
+  }
 
   @override
   void dispose() {
-    _isTitleHovered.dispose();
+    _historySync?.call();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final meta = trackMetadataSignal();
-
-        return Column(
-          crossAxisAlignment: widget.isNarrow
-              ? CrossAxisAlignment.start
-              : CrossAxisAlignment.center,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= GLayout.wideBreakpoint;
+        return GScrollPage(
           children: [
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              mainAxisAlignment: widget.isNarrow
-                  ? MainAxisAlignment.start
-                  : MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.baseline,
-              textBaseline: TextBaseline.alphabetic,
-              children: [
-                Flexible(
-                  child: MouseRegion(
-                    onEnter: (_) => _isTitleHovered.value = true,
-                    onExit: (_) => _isTitleHovered.value = false,
-                    cursor: meta.albumId != null
-                        ? SystemMouseCursors.click
-                        : SystemMouseCursors.basic,
-                    child: ValueListenableBuilder<bool>(
-                      valueListenable: _isTitleHovered,
-                      builder: (context, hovered, _) {
-                        return GestureDetector(
-                          onTap: () {
-                            if (meta.albumId != null) {
-                              navigateTo(AppSection.album, meta.albumId);
-                            }
-                          },
-                          child: Text(
-                            meta.title,
-                            style: TextStyle(
-                              fontSize: widget.small
-                                  ? (widget.isNarrow ? 18 : 32)
-                                  : (widget.isNarrow ? 22 : 42),
-                              fontWeight: FontWeight.w900,
-                              color: Theme.of(context).colorScheme.onSurface,
-                              letterSpacing: -1,
-                              height: 1.05,
-                              decoration: hovered && meta.albumId != null
-                                  ? TextDecoration.underline
-                                  : null,
-                              shadows: widget.isNarrow
-                                  ? null
-                                  : const [Shadow(blurRadius: 20)],
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ),
-                TrackVersionWidget(
-                  version: meta.version,
-                  fontSize: widget.small
-                      ? (widget.isNarrow ? 12 : 16)
-                      : (widget.isNarrow ? 14 : 20),
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.3),
-                  padding: const EdgeInsets.only(left: 12),
-                ),
-              ],
+            SignalBuilder(
+              builder: (context) {
+                final account = accountSignal();
+                final active = activeStoredAccountSignal();
+                final name = _firstName(
+                  account?.displayName ?? account?.fullName ?? active?.displayName ?? account?.login ?? '',
+                );
+                return Text(
+                  name.isEmpty ? greeting() : '${greeting()}, $name',
+                  style: GText.sm(color: GColors.mutedForeground),
+                );
+              },
             ),
-            const SizedBox(height: 8),
-            ArtistNamesWidget(
-              artists: meta.artists,
-              fontSize: widget.small
-                  ? (widget.isNarrow ? 12 : 16)
-                  : (widget.isNarrow ? 14 : 22),
-              color: Theme.of(
-                context,
-              ).colorScheme.onSurface.withValues(alpha: 0.6),
-            ),
+            const SizedBox(height: 16),
+            if (wide)
+              const SizedBox(
+                height: 264,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(flex: 14, child: _WaveHero()),
+                    SizedBox(width: 12),
+                    Expanded(flex: 10, child: _MyPlaylists()),
+                  ],
+                ),
+              )
+            else ...[
+              const _WaveHero(),
+              const SizedBox(height: 12),
+              const SizedBox(height: 168, child: _MyPlaylists()),
+            ],
+            const SizedBox(height: 48),
+            const _PlaylistShelf(),
+            const SizedBox(height: 48),
+            if (wide)
+              const Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(child: _RecentTracks()),
+                  SizedBox(width: 48),
+                  Expanded(child: _CollectionAlbums()),
+                ],
+              )
+            else ...[
+              const _RecentTracks(),
+              const SizedBox(height: 48),
+              const _CollectionAlbums(),
+            ],
           ],
         );
       },
     );
   }
+
+  static String _firstName(String full) {
+    final trimmed = full.trim();
+    if (trimmed.isEmpty) return '';
+    return trimmed.split(RegExp(r'\s+')).first;
+  }
 }
 
-class _HomeMainControls extends StatelessWidget {
-  final bool showLyrics;
-  final bool small;
-  final bool isNarrow;
-
-  const _HomeMainControls({
-    required this.showLyrics,
-    required this.small,
-    this.isNarrow = false,
-  });
+class _WaveHero extends StatelessWidget {
+  const _WaveHero();
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final trackId = trackMetadataSignal().id;
-        final isPlaying = isPlayingSignal();
-        final isLiked = isLikedSignal();
-        final isDisliked = isDislikedSignal();
-        final isShuffled = isShuffledSignal();
-        final repeatMode = repeatModeSignal();
-        final accentColor = accentColorSignal.value;
-        final scheme = Theme.of(context).colorScheme;
-        final onSurface = scheme.onSurface;
-        final onSurfaceVariant = scheme.onSurfaceVariant;
+        final seeds = currentWaveSeedsSignal();
+        final waveActive = seeds.isNotEmpty;
+        final playing = isPlayingSignal() && waveActive;
+        final meta = trackMetadataSignal();
+        final p = trackProgressSignal();
+        final ratio = waveActive && p.durationMs > 1 ? (p.positionMs / p.durationMs).clamp(0.0, 1.0) : 0.0;
+        final artists = artistNames(meta.artists);
+        final wide = MediaQuery.sizeOf(context).width >= GLayout.mediumBreakpoint;
 
-        var repeatIcon = Icons.repeat;
-        var repeatColor = onSurfaceVariant;
-        if (repeatMode == RepeatModeDto.all) {
-          repeatColor = accentColor;
-        } else if (repeatMode == RepeatModeDto.single) {
-          repeatIcon = Icons.repeat_one;
-          repeatColor = accentColor;
-        }
-
-        if (isNarrow) {
-          return Column(
+        return Container(
+          padding: EdgeInsets.all(wide ? 32 : 24),
+          decoration: BoxDecoration(
+            color: GColors.card,
+            borderRadius: BorderRadius.circular(GRadius.x3l),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  IconButton(
-                    icon: Icon(
-                      isDisliked
-                          ? Icons.heart_broken
-                          : Icons.heart_broken_outlined,
-                      size: 24,
-                      color: isDisliked ? Colors.blueGrey : onSurfaceVariant,
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Моя волна', style: GText.headline(wide ? 36 : 30)),
+                        const SizedBox(height: 8),
+                        Text(
+                          playing && meta.id != null
+                              ? 'Сейчас: ${meta.title}${artists.isEmpty ? '' : ' — $artists'}'
+                              : 'Персональный поток, который учится на ваших лайках',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: GText.sm(color: GColors.mutedForeground),
+                        ),
+                      ],
                     ),
-                    onPressed: () => trackId != null
-                        ? unawaited(
-                            PlaybackController.toggleDislike(trackId: trackId),
-                          )
-                        : null,
                   ),
-                  IconButton(
-                    icon: Icon(
-                      Icons.skip_previous_rounded,
-                      size: 42,
-                      color: onSurface,
-                    ),
-                    onPressed: () => unawaited(PlaybackController.prev()),
-                  ),
-                  IconButton(
-                    iconSize: 84,
-                    icon: Icon(
-                      isPlaying
-                          ? Icons.pause_circle_filled_rounded
-                          : Icons.play_circle_filled_rounded,
-                    ),
-                    color: onSurface,
-                    onPressed: () => unawaited(PlaybackController.togglePlay()),
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      Icons.skip_next_rounded,
-                      size: 42,
-                      color: onSurface,
-                    ),
-                    onPressed: () => unawaited(PlaybackController.next()),
-                  ),
-                  SizedBox(
-                    width: 48,
-                    height: 48,
-                    child: Center(
-                      child: AnimatedLikeButton(
-                        isLiked: isLiked,
-                        size: 26,
-                        onTap: trackId != null
-                            ? () => unawaited(
-                                PlaybackController.toggleLike(
-                                  trackId: trackId,
-                                ),
-                              )
-                            : null,
-                      ),
-                    ),
+                  const SizedBox(width: 16),
+                  GCircleButton(
+                    icon: LucideIcons.arrowUpRight,
+                    tooltip: 'Открыть «Мою волну»',
+                    onPressed: () => navigateTo(AppSection.wave),
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 40),
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Row(
-                    children: [
-                      IconButton(
-                        icon: Icon(
-                          Icons.lyrics_rounded,
-                          size: 24,
-                          color: showLyrics ? accentColor : onSurfaceVariant,
-                        ),
-                        onPressed: () =>
-                            showLyricsSignal.value = !showLyricsSignal.value,
-                      ),
-                      IconButton(
-                        icon: Icon(
-                          Icons.shuffle,
-                          size: 24,
-                          color: isShuffled ? accentColor : onSurfaceVariant,
-                        ),
-                        onPressed: () =>
-                            unawaited(PlaybackController.toggleShuffle()),
-                      ),
-                    ],
+                  GPlayButton(
+                    size: 56,
+                    iconSize: 20,
+                    isPlaying: playing,
+                    onPressed: () => unawaited(
+                      waveActive && meta.id != null
+                          ? PlaybackController.togglePlay()
+                          : WaveController.startMyWave(),
+                    ),
                   ),
-                  if (Platform.isAndroid) const _WaveSettingsButton(),
-                  Row(
-                    children: [
-                      IconButton(
-                        icon: Icon(
-                          repeatIcon,
-                          size: 24,
-                          color: repeatColor,
-                        ),
-                        onPressed: () =>
-                            unawaited(PlaybackController.toggleRepeat()),
-                      ),
-                      const SizedBox(
-                        width: 48,
-                        child: Center(
-                          child: CommonQualitySelector(iconSize: 24),
-                        ),
-                      ),
-                    ],
+                  const SizedBox(width: 20),
+                  Expanded(
+                    child: GWaveform(
+                      seed: waveActive ? (meta.id ?? 'wave') : 'wave',
+                      count: 64,
+                      height: 48,
+                      progress: ratio,
+                    ),
                   ),
                 ],
               ),
             ],
-          );
-        }
+          ),
+        );
+      },
+    );
+  }
+}
 
-        return Column(
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                IconButton(
-                  icon: Icon(
-                    Icons.lyrics_rounded,
-                    size: small ? 20 : 24,
-                    color: showLyrics ? accentColor : onSurfaceVariant,
-                  ),
-                  onPressed: () =>
-                      showLyricsSignal.value = !showLyricsSignal.value,
-                ),
-                SizedBox(width: small ? 8 : 12),
-                IconButton(
-                  icon: Icon(
-                    Icons.shuffle,
-                    size: small ? 20 : 24,
-                    color: isShuffled ? accentColor : onSurfaceVariant,
-                  ),
-                  onPressed: () =>
-                      unawaited(PlaybackController.toggleShuffle()),
-                ),
-                SizedBox(width: small ? 8 : 12),
-                IconButton(
-                  icon: Icon(
-                    isDisliked
-                        ? Icons.heart_broken
-                        : Icons.heart_broken_outlined,
-                    size: small ? 20 : 24,
-                    color: isDisliked ? Colors.blueGrey : onSurfaceVariant,
-                  ),
-                  onPressed: () => trackId != null
-                      ? unawaited(
-                          PlaybackController.toggleDislike(trackId: trackId),
-                        )
-                      : null,
-                ),
-                SizedBox(width: small ? 12 : 20),
-                IconButton(
-                  icon: Icon(
-                    Icons.skip_previous_rounded,
-                    size: small ? 32 : 42,
-                    color: onSurface,
-                  ),
-                  onPressed: () => unawaited(PlaybackController.prev()),
-                ),
-                SizedBox(width: small ? 16 : 24),
-                IconButton(
-                  iconSize: small ? 56 : 72,
-                  icon: Icon(
-                    isPlaying
-                        ? Icons.pause_circle_filled_rounded
-                        : Icons.play_circle_filled_rounded,
-                  ),
-                  color: onSurface,
-                  onPressed: () => unawaited(PlaybackController.togglePlay()),
-                ),
-                SizedBox(width: small ? 16 : 24),
-                IconButton(
-                  icon: Icon(
-                    Icons.skip_next_rounded,
-                    size: small ? 32 : 42,
-                    color: onSurface,
-                  ),
-                  onPressed: () => unawaited(PlaybackController.next()),
-                ),
-                SizedBox(width: small ? 12 : 20),
-                AnimatedLikeButton(
-                  isLiked: isLiked,
-                  size: small ? 22 : 26,
-                  onTap: trackId != null
-                      ? () => unawaited(
-                          PlaybackController.toggleLike(trackId: trackId),
-                        )
-                      : null,
-                ),
-                SizedBox(width: small ? 8 : 12),
-                IconButton(
-                  icon: Icon(
-                    repeatIcon,
-                    size: small ? 20 : 24,
-                    color: repeatColor,
-                  ),
-                  onPressed: () => unawaited(PlaybackController.toggleRepeat()),
-                ),
-                SizedBox(width: small ? 8 : 12),
-                CommonQualitySelector(iconSize: small ? 20 : 24),
-              ],
+class _MyPlaylists extends StatelessWidget {
+  const _MyPlaylists();
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final liked = likedTracksSignal();
+        final playlists = playlistsSignal().where((p) => p.kind != 3).take(3).toList();
+        final tiles = <Widget>[
+          CompactMediaTile(
+            title: 'Мне нравится',
+            subtitle: liked.isEmpty ? 'Ваши лайки' : '${liked.length} ${plural(liked.length, 'трек', 'трека', 'треков')}',
+            cover: const LikedCover(size: 56, radius: GRadius.xl),
+            onTap: () => navigateTo(AppSection.liked),
+          ),
+          for (final p in playlists)
+            CompactMediaTile(
+              title: p.title,
+              subtitle: '${p.trackCount} ${plural(p.trackCount, 'трек', 'трека', 'треков')}',
+              coverUrl: p.coverUrl,
+              onTap: () => navigateTo(AppSection.playlist, '${p.uid}:${p.kind}'),
             ),
-            if (!Platform.isAndroid) ...[
-              SizedBox(height: small ? 20 : 32),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+          if (playlists.length < 3)
+            CompactMediaTile(
+              title: 'Все плейлисты',
+              subtitle: 'Коллекция',
+              cover: Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: GColors.accent,
+                  borderRadius: BorderRadius.circular(GRadius.xl),
+                ),
+                child: const Icon(LucideIcons.library, size: 20, color: GColors.mutedForeground),
+              ),
+              onTap: () => navigateTo(AppSection.playlists),
+            ),
+        ];
+        // Two columns like the reference; with two tiles or fewer they
+        // stack so they do not stretch into tall empty cards.
+        final perRow = tiles.length <= 2 ? 1 : 2;
+        final rows = <Widget>[];
+        for (var i = 0; i < tiles.length; i += perRow) {
+          rows.add(
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Icon(
-                    Icons.volume_down,
-                    color: onSurfaceVariant,
-                    size: 18,
-                  ),
-                  const SizedBox(width: 12),
-                  CommonVolumeSlider(
-                    width: small ? 180 : 240,
-                    activeColor: accentColor,
-                  ),
-                  const SizedBox(width: 12),
-                  Icon(Icons.volume_up, color: onSurfaceVariant, size: 18),
-                  const SizedBox(width: 8),
-                  const AudioDeviceButton(),
+                  Expanded(child: tiles[i]),
+                  if (perRow == 2) ...[
+                    const SizedBox(width: 12),
+                    Expanded(child: i + 1 < tiles.length ? tiles[i + 1] : const SizedBox.shrink()),
+                  ],
                 ],
               ),
-            ],
+            ),
+          );
+          if (i + perRow < tiles.length) rows.add(const SizedBox(height: 12));
+        }
+        return Column(children: rows);
+      },
+    );
+  }
+}
+
+class _PlaylistShelf extends StatelessWidget {
+  const _PlaylistShelf();
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final playlists = playlistsSignal();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            GSectionHeader(
+              'Ваши плейлисты',
+              trailing: GTextAction(label: 'Все', onPressed: () => navigateTo(AppSection.playlists)),
+            ),
+            if (playlists.isEmpty)
+              Text('Плейлистов пока нет.', style: GText.sm(color: GColors.mutedForeground))
+            else
+              MediaGrid(
+                children: [
+                  for (final p in playlists.take(6))
+                    MediaTile(
+                      title: p.title,
+                      subtitle: '${p.trackCount} ${plural(p.trackCount, 'трек', 'трека', 'треков')}',
+                      coverUrl: p.coverUrl,
+                      icon: LucideIcons.listMusic,
+                      onTap: () => navigateTo(AppSection.playlist, '${p.uid}:${p.kind}'),
+                      menu: () => [
+                        GMenuItem(
+                          label: 'Слушать',
+                          icon: LucideIcons.play,
+                          onSelected: () => unawaited(PlaybackController.playPlaylist('${p.uid}', p.kind)),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
           ],
         );
       },
@@ -578,63 +327,86 @@ class _HomeMainControls extends StatelessWidget {
   }
 }
 
-class _WaveSettingsButton extends StatelessWidget {
-  const _WaveSettingsButton();
+class _RecentTracks extends StatelessWidget {
+  const _RecentTracks();
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: () {
-          unawaited(
-            showModalBottomSheet<void>(
-              context: context,
-              isScrollControlled: true,
-              showDragHandle: true,
-              shape: const RoundedRectangleBorder(
-                borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-              ),
-              builder: (context) => DraggableScrollableSheet(
-                initialChildSize: 0.6,
-                minChildSize: 0.4,
-                maxChildSize: 0.9,
-                expand: false,
-                snap: true,
-                builder: (context, scrollController) => WaveSettingsPanel(
-                  onSelected: () => Navigator.pop(context),
-                  scrollController: scrollController,
+    return SignalBuilder(
+      builder: (context) {
+        final recent = recentTracksSignal().take(5).toList();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const GSectionHeader('Недавно слушали', bottom: 12),
+            if (recent.isEmpty)
+              Text(
+                'Здесь появятся треки, которые вы слушали в этом аккаунте.',
+                style: GText.sm(color: GColors.mutedForeground),
+              )
+            else
+              for (final t in recent)
+                TrackRow(
+                  track: t,
+                  showAlbum: false,
+                  onPlay: () => unawaited(PlaybackController.playTrack(t.id)),
                 ),
-              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _CollectionAlbums extends StatelessWidget {
+  const _CollectionAlbums();
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final albums = likedAlbumsSignal().take(4).toList();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            GSectionHeader(
+              'Альбомы в коллекции',
+              trailing: albums.isEmpty
+                  ? null
+                  : GTextAction(label: 'Все', onPressed: () => navigateTo(AppSection.liked)),
             ),
-          );
-        },
-        borderRadius: BorderRadius.circular(24),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
-          child: Center(
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-              decoration: BoxDecoration(
-                color: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.1),
-                ),
+            if (albums.isEmpty)
+              Text('Добавьте альбомы в коллекцию — они появятся здесь.', style: GText.sm(color: GColors.mutedForeground))
+            else
+              LayoutBuilder(
+                builder: (context, c) {
+                  final tileWidth = (c.maxWidth - 16) / 2;
+                  return Wrap(
+                    spacing: 16,
+                    runSpacing: 16,
+                    children: [
+                      for (final a in albums)
+                        SizedBox(
+                          width: tileWidth,
+                          child: CompactMediaTile(
+                            card: false,
+                            coverSize: MediaQuery.sizeOf(context).width >= GLayout.mediumBreakpoint ? 72 : 64,
+                            title: a.title,
+                            subtitle: [
+                              artistNames(a.artists),
+                              if (a.year != null) '${a.year}',
+                            ].where((s) => s.isNotEmpty).join(' · '),
+                            coverUrl: a.coverUrl,
+                            onTap: () => navigateTo(AppSection.album, a.id),
+                          ),
+                        ),
+                    ],
+                  );
+                },
               ),
-              child: Icon(
-                Icons.tune_rounded,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-                size: 16,
-              ),
-            ),
-          ),
-        ),
-      ),
+          ],
+        );
+      },
     );
   }
 }

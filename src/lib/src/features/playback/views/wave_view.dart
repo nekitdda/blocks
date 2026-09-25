@@ -1,828 +1,467 @@
 import 'dart:async';
 
-import 'package:flutter/rendering.dart';
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
-import 'package:youmuz/src/features/core/views/widgets/responsive.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_actions.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_row.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
 import 'package:youmuz/src/features/playback/providers/wave_provider.dart';
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
-class WaveSettingsPanel extends StatelessWidget {
-  final VoidCallback onSelected;
-  final ScrollController? scrollController;
-  const WaveSettingsPanel({
-    required this.onSelected,
-    this.scrollController,
-    super.key,
-  });
+/// Wave setting presets (Rotor seeds).
+class WaveOption {
+  const WaveOption(this.label, this.seed);
+  final String label;
+  final String seed;
+}
+
+class WaveGroup {
+  const WaveGroup(this.label, this.options);
+  final String label;
+  final List<WaveOption> options;
+}
+
+const waveGroups = [
+  WaveGroup('Занятие', [
+    WaveOption('Просыпаюсь', 'activity:wake-up'),
+    WaveOption('Работаю', 'activity:work-background'),
+    WaveOption('В дороге', 'activity:road-trip'),
+    WaveOption('Тренируюсь', 'activity:workout'),
+    WaveOption('Засыпаю', 'activity:fall-asleep'),
+  ]),
+  WaveGroup('Характер', [
+    WaveOption('Любимое', 'personal:collection'),
+    WaveOption('Незнакомое', 'personal:never-heard'),
+    WaveOption('Популярное', 'personal:hits'),
+  ]),
+  WaveGroup('Настроение', [
+    WaveOption('Бодрое', 'mood:energetic'),
+    WaveOption('Весёлое', 'mood:happy'),
+    WaveOption('Спокойное', 'mood:calm'),
+    WaveOption('Грустное', 'mood:sad'),
+  ]),
+  WaveGroup('Язык', [
+    WaveOption('Русский', 'local-language:russian'),
+    WaveOption('Иностранный', 'local-language:english'),
+    WaveOption('Без слов', 'local-language:instrumental'),
+  ]),
+];
+
+const _defaultSeed = 'user:onyourwave';
+
+/// Human label for a seed ("activity:workout" -> "Тренируюсь").
+String waveSeedLabel(String seed, List<StationCategoryDto> stations) {
+  for (final g in waveGroups) {
+    for (final o in g.options) {
+      if (o.seed == seed) return o.label;
+    }
+  }
+  for (final c in stations) {
+    for (final i in c.items) {
+      if (i.seed == seed) return i.label;
+    }
+  }
+  if (seed.startsWith('track:')) {
+    final first = seed.indexOf(':');
+    final second = seed.indexOf(':', first + 1);
+    return second > 0 ? 'По треку «${seed.substring(second + 1)}»' : 'По треку';
+  }
+  if (seed.startsWith('artist:')) return 'По исполнителю';
+  return seed;
+}
+
+bool _isWaveActive(List<String> seeds) => seeds.isNotEmpty;
+
+/// "Моя волна": large now-playing block with a waveform seek bar and the
+/// wave settings in a side column.
+class WaveView extends StatelessWidget {
+  const WaveView({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final currentSeeds = currentWaveSeedsSignal();
-        final isNarrow = context.isNarrow;
-
-        return Material(
-          color: Colors.transparent,
-          child: Stack(
-            children: [
-              SingleChildScrollView(
-                controller: scrollController,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 24,
-                  vertical: 24,
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final wide = width >= GLayout.wideBreakpoint;
+        final padding = GLayout.pagePadding(width);
+        final main = const _WaveMain();
+        const aside = _WaveAside();
+        return Scrollbar(
+          child: SingleChildScrollView(
+            primary: true,
+            child: GPageFrame(
+              padding: EdgeInsets.fromLTRB(padding.left, wide ? 48 : 32, padding.right, 48),
+              child: wide
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Expanded(
-                          child: Text(
-                            'Настроить Мою волну',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Theme.of(context).colorScheme.onSurface,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: -0.5,
-                            ),
+                        Expanded(child: main),
+                        const SizedBox(width: 40),
+                        Container(
+                          width: 320 + 33,
+                          padding: const EdgeInsets.only(left: 32),
+                          decoration: const BoxDecoration(
+                            border: Border(left: BorderSide(color: GColors.border)),
                           ),
-                        ),
-                        const SizedBox(width: 8),
-                        SizedBox(
-                          width: 40,
-                          height: 40,
-                          child:
-                              (currentSeeds.isNotEmpty &&
-                                  !currentSeeds.contains('user:onyourwave'))
-                              ? MouseRegion(
-                                  cursor: SystemMouseCursors.click,
-                                  child: GestureDetector(
-                                    onTap: () {
-                                      unawaited(WaveController.resetStations());
-                                    },
-                                    behavior: HitTestBehavior.opaque,
-                                    child: Icon(
-                                      Icons.refresh,
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.onSurfaceVariant,
-                                      size: 20,
-                                    ),
-                                  ),
-                                )
-                              : null,
-                        ),
-                        SizedBox(
-                          width: 40,
-                          height: 40,
-                          child: MouseRegion(
-                            cursor: SystemMouseCursors.click,
-                            child: GestureDetector(
-                              onTap: () async {
-                                await showModalBottomSheet<void>(
-                                  context: context,
-                                  backgroundColor: Colors.transparent,
-                                  isScrollControlled: true,
-                                  builder: (context) =>
-                                      const _AllStationsSheet(),
-                                );
-                              },
-                              behavior: HitTestBehavior.opaque,
-                              child: Icon(
-                                Icons.explore,
-                                color: Theme.of(
-                                  context,
-                                ).colorScheme.onSurfaceVariant,
-                                size: 20,
-                              ),
-                            ),
-                          ),
+                          child: aside,
                         ),
                       ],
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [main, const SizedBox(height: 40), aside],
                     ),
-                    const SizedBox(height: 24),
-                    _buildSectionTitle(context, 'Под занятие'),
-
-                    _buildChips(context, [
-                      _VibeItem('Просыпаюсь', 'activity:wake-up'),
-                      _VibeItem('В дороге', 'activity:road-trip'),
-                      _VibeItem('Работаю', 'activity:work-background'),
-                      _VibeItem('Тренируюсь', 'activity:workout'),
-                      _VibeItem('Засыпаю', 'activity:fall-asleep'),
-                    ], currentSeeds),
-                    const SizedBox(height: 24),
-                    _buildSectionTitle(context, 'По характеру'),
-                    Row(
-                      children: [
-                        _CharacterCard(
-                          label: 'Любимое',
-                          icon: Icons.favorite,
-                          color: Colors.red,
-                          seed: 'personal:collection',
-                          onSelected: onSelected,
-                          isSelected: currentSeeds.contains(
-                            'personal:collection',
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        _CharacterCard(
-                          label: 'Незнакомое',
-                          icon: Icons.auto_awesome,
-                          color: Colors.amber,
-                          seed: 'personal:never-heard',
-                          onSelected: onSelected,
-                          isSelected: currentSeeds.contains(
-                            'personal:never-heard',
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        _CharacterCard(
-                          label: 'Популярное',
-                          icon: Icons.bolt,
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          seed: 'personal:hits',
-                          onSelected: onSelected,
-                          isSelected: currentSeeds.contains('personal:hits'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 24),
-                    _buildSectionTitle(context, 'Под настроение'),
-                    _buildMoods([
-                      _MoodItem('Бодрое', [
-                        Colors.orange,
-                        Colors.deepOrange,
-                      ], 'mood:energetic'),
-                      _MoodItem('Весёлое', [
-                        Colors.lightGreen,
-                        Colors.lime,
-                      ], 'mood:happy'),
-                      _MoodItem('Спокойное', [
-                        Colors.cyan,
-                        Colors.teal,
-                      ], 'mood:calm'),
-                      _MoodItem('Грустное', [
-                        Colors.blue,
-                        Colors.indigo,
-                      ], 'mood:sad'),
-                    ], currentSeeds),
-                    const SizedBox(height: 24),
-                    _buildSectionTitle(context, 'По языку'),
-                    _buildChips(context, [
-                      _VibeItem('Русский', 'local-language:russian'),
-                      _VibeItem('Иностранный', 'local-language:english'),
-                      _VibeItem('Без слов', 'local-language:instrumental'),
-                    ], currentSeeds),
-                    const SizedBox(height: 24),
-                    if (currentSeeds.isNotEmpty &&
-                        !currentSeeds.contains('user:onyourwave') &&
-                        !_isMainSeed(currentSeeds.first))
-                      _buildActiveExtraStation(context, currentSeeds.first),
-                  ],
-                ),
-              ),
-              if (isNarrow)
-                Positioned(
-                  right: 24,
-                  bottom: 32,
-                  child: FloatingActionButton(
-                    onPressed: () {
-                      unawaited(WaveController.startMyWave());
-                      onSelected();
-                    },
-                    backgroundColor: Theme.of(context).colorScheme.primary,
-                    foregroundColor: Colors.black,
-                    elevation: 8,
-                    child: const Icon(Icons.play_arrow_rounded, size: 28),
-                  ),
-                ),
-            ],
+            ),
           ),
         );
       },
     );
   }
+}
 
-  bool _isMainSeed(String seed) {
-    const mainSeeds = {
-      'activity:wake-up',
-      'activity:road-trip',
-      'activity:work-background',
-      'activity:workout',
-      'activity:fall-asleep',
-      'personal:collection',
-      'personal:never-heard',
-      'personal:hits',
-      'mood:energetic',
-      'mood:happy',
-      'mood:calm',
-      'mood:sad',
-      'local-language:russian',
-      'local-language:english',
-      'local-language:instrumental',
-    };
-    return mainSeeds.contains(seed);
+class _WaveMain extends StatelessWidget {
+  const _WaveMain();
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final seeds = currentWaveSeedsSignal();
+        final waveActive = _isWaveActive(seeds);
+        final playing = isPlayingSignal();
+        final meta = trackMetadataSignal();
+        final hasTrack = meta.id != null;
+        final stations = waveStationsSignal().value ?? const <StationCategoryDto>[];
+        final width = MediaQuery.sizeOf(context).width;
+        final titleSize = width >= 1280 ? 96.0 : (width >= 768 ? 72.0 : 48.0);
+        final p = trackProgressSignal();
+        final duration = hasTrack ? p.durationMs : 0.0;
+        final ratio = duration > 1 ? (p.positionMs / duration).clamp(0.0, 1.0) : 0.0;
+        final activeLabels = seeds
+            .where((s) => s != _defaultSeed)
+            .map((s) => waveSeedLabel(s, stations))
+            .toList();
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                AnimatedContainer(
+                  duration: GDurations.fast,
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: playing && waveActive ? GColors.brand : GColors.mutedForeground,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Semantics(header: true, child: Text('Моя волна', style: GText.sm(color: GColors.mutedForeground))),
+                const SizedBox(width: 8),
+                Text('·', style: GText.sm(color: GColors.mutedForeground)),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    activeLabels.isEmpty
+                        ? (waveActive ? 'Персональный поток' : 'Не запущена')
+                        : activeLabels.join(', ').toLowerCase().replaceFirstMapped(
+                            RegExp('^.'),
+                            (m) => m[0]!.toUpperCase(),
+                          ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GText.sm(color: GColors.mutedForeground),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 40),
+            if (hasTrack && waveActive)
+              _NowPlayingHero(meta: meta, titleSize: titleSize)
+            else
+              _IdleHero(titleSize: titleSize),
+            const SizedBox(height: 48),
+            GWaveform(
+              seed: meta.id ?? 'wave',
+              count: 120,
+              height: 80,
+              progress: hasTrack && waveActive ? ratio : 0,
+              onSeek: hasTrack && waveActive && duration > 1
+                  ? (r) => unawaited(PlaybackController.seekTo(Duration(milliseconds: (r * duration).round())))
+                  : null,
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(formatDuration(hasTrack && waveActive ? p.positionMs.round() : 0), style: GText.time(size: 12)),
+                Text(formatDuration(hasTrack && waveActive && duration > 1 ? duration.round() : 0), style: GText.time(size: 12)),
+              ],
+            ),
+            const SizedBox(height: 32),
+            Row(
+              children: [
+                GPlayButton(
+                  size: 64,
+                  iconSize: 24,
+                  isPlaying: playing && waveActive,
+                  loading: waveActive && showBufferingIndicatorSignal(),
+                  onPressed: () => unawaited(
+                    waveActive && hasTrack ? PlaybackController.togglePlay() : WaveController.startMyWave(),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                GCircleButton(
+                  glyph: GGlyphKind.skipForward,
+                  size: 48,
+                  iconSize: 20,
+                  variant: GCircleVariant.strong,
+                  tooltip: 'Следующий трек',
+                  onPressed: waveActive && hasTrack ? () => unawaited(PlaybackController.next()) : null,
+                ),
+                const SizedBox(width: 12),
+                GCircleButton(
+                  glyph: GGlyphKind.heart,
+                  size: 48,
+                  iconSize: 20,
+                  variant: GCircleVariant.strong,
+                  active: isLikedSignal(),
+                  tooltip: 'Нравится',
+                  onPressed: hasTrack ? () => unawaited(PlaybackController.toggleLike(trackId: meta.id!)) : null,
+                ),
+                const SizedBox(width: 12),
+                GCircleButton(
+                  icon: LucideIcons.ban,
+                  size: 48,
+                  iconSize: 20,
+                  tooltip: 'Не рекомендовать',
+                  active: isDislikedSignal(),
+                  onPressed: hasTrack
+                      ? () => unawaited(PlaybackController.toggleDislike(trackId: meta.id!))
+                      : null,
+                ),
+              ],
+            ),
+          ],
+        );
+      },
+    );
   }
+}
 
-  Widget _buildActiveExtraStation(BuildContext context, String seed) {
+class _NowPlayingHero extends StatelessWidget {
+  const _NowPlayingHero({required this.meta, required this.titleSize});
+
+  final ({
+    String? id,
+    String title,
+    String? version,
+    List<TrackArtistDto> artists,
+    String? coverUrl,
+    String? albumId,
+    String? codec,
+  }) meta;
+  final double titleSize;
+
+  @override
+  Widget build(BuildContext context) {
+    final narrow = MediaQuery.sizeOf(context).width < 768;
+    final cover = GCover(url: meta.coverUrl, size: narrow ? 160 : 224, radius: GRadius.xl);
+    final text = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(meta.title, style: GText.display(titleSize), maxLines: 3, overflow: TextOverflow.ellipsis),
+        const SizedBox(height: 16),
+        ArtistLinks(artists: meta.artists, style: GText.lg(color: GColors.mutedForeground)),
+      ],
+    );
+    return Semantics(
+      liveRegion: true,
+      child: narrow
+          ? Column(crossAxisAlignment: CrossAxisAlignment.start, children: [cover, const SizedBox(height: 32), text])
+          : Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [cover, const SizedBox(width: 32), Expanded(child: text)],
+            ),
+    );
+  }
+}
+
+class _IdleHero extends StatelessWidget {
+  const _IdleHero({required this.titleSize});
+
+  final double titleSize;
+
+  @override
+  Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildSectionTitle(context, 'Активный режим'),
-        SignalBuilder(
-          builder: (context) {
-            final catsFuture = waveStationsSignal.value;
-            var label = seed;
-
-            if (seed.startsWith('track:')) {
-              // Display hint is everything after the second ':'.
-              // indexOf-based so titles containing ':' don't break parsing.
-              final first = seed.indexOf(':');
-              final second = first >= 0 ? seed.indexOf(':', first + 1) : -1;
-              if (second >= 0 && second + 1 < seed.length) {
-                label = seed.substring(second + 1);
-              }
-            }
-
-            if (catsFuture.hasValue) {
-              for (final cat in catsFuture.value!) {
-                for (final item in cat.items) {
-                  if (item.seed == seed) {
-                    label = item.label;
-                    break;
-                  }
-                }
-              }
-            }
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: _RoundedChip(
-                item: _VibeItem(label, seed),
-                onSelected: onSelected,
-                isSelected: true,
-              ),
-            );
-          },
+        Text('Моя волна', style: GText.display(titleSize)),
+        const SizedBox(height: 16),
+        Text(
+          'Персональный поток, который учится на ваших лайках. Выберите настроение справа или просто нажмите «Играть».',
+          style: GText.lg(color: GColors.mutedForeground),
         ),
       ],
     );
   }
-
-  Widget _buildSectionTitle(BuildContext context, String title) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Text(
-        title,
-        style: TextStyle(
-          color: Theme.of(
-            context,
-          ).colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
-          fontSize: 13,
-          fontWeight: FontWeight.w800,
-          letterSpacing: 1.2,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildChips(
-    BuildContext context,
-    List<_VibeItem> items,
-    List<String> currentSeeds,
-  ) {
-    if (!context.isNarrow) {
-      return Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: items
-            .map(
-              (i) => _RoundedChip(
-                item: i,
-                onSelected: onSelected,
-                isSelected: currentSeeds.contains(i.seed),
-              ),
-            )
-            .toList(),
-      );
-    }
-
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      clipBehavior: Clip.none,
-      child: Row(
-        children: items.asMap().entries.map((entry) {
-          final i = entry.value;
-          final isLast = entry.key == items.length - 1;
-          return Padding(
-            padding: EdgeInsets.only(right: isLast ? 0 : 8),
-            child: _RoundedChip(
-              item: i,
-              onSelected: onSelected,
-              isSelected: currentSeeds.contains(i.seed),
-            ),
-          );
-        }).toList(),
-      ),
-    );
-  }
-
-  Widget _buildMoods(List<_MoodItem> moods, List<String> currentSeeds) {
-    return Row(
-      children: moods
-          .map(
-            (m) => Expanded(
-              child: _MoodCircle(
-                mood: m,
-                onSelected: onSelected,
-                isSelected: currentSeeds.contains(m.seed),
-              ),
-            ),
-          )
-          .toList(),
-    );
-  }
 }
 
-class _VibeItem {
-  final String label;
-  final String seed;
-  _VibeItem(this.label, this.seed);
-}
-
-class _MoodItem {
-  final String label;
-  final List<Color> colors;
-  final String seed;
-  _MoodItem(this.label, this.colors, this.seed);
-}
-
-class _RoundedChip extends StatelessWidget {
-  final _VibeItem item;
-  final VoidCallback onSelected;
-  final bool isSelected;
-  const _RoundedChip({
-    required this.item,
-    required this.onSelected,
-    required this.isSelected,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = context.isNarrow;
-    final panelWidth = isNarrow ? (screenWidth - 48) : 480.0;
-    final maxLabelWidth = panelWidth - 48 - 40; // Subtract padding for safety
-
-    return FilterChip(
-      selected: isSelected,
-      label: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: maxLabelWidth > 0 ? maxLabelWidth : 100,
-        ),
-        child: Text(
-          item.label,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-      ),
-      onSelected: (_) {
-        unawaited(WaveController.toggleStation(item.seed));
-      },
-      backgroundColor: Theme.of(
-        context,
-      ).colorScheme.onSurface.withValues(alpha: 0.05),
-      selectedColor: Theme.of(
-        context,
-      ).colorScheme.onSurface.withValues(alpha: 0.2),
-      labelStyle: TextStyle(
-        color: isSelected
-            ? Theme.of(context).colorScheme.onSurface
-            : Theme.of(context).colorScheme.onSurfaceVariant,
-        fontWeight: isSelected ? FontWeight.w900 : FontWeight.w600,
-      ),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      side: isSelected
-          ? BorderSide(
-              color: Theme.of(context).colorScheme.onSurface.withValues(
-                alpha: 0.24,
-              ),
-            )
-          : BorderSide.none,
-      showCheckmark: false,
-    );
-  }
-}
-
-class _CharacterCard extends StatelessWidget {
-  final String label;
-  final IconData icon;
-  final Color color;
-  final String seed;
-  final VoidCallback onSelected;
-  final bool isSelected;
-  const _CharacterCard({
-    required this.label,
-    required this.icon,
-    required this.color,
-    required this.seed,
-    required this.onSelected,
-    required this.isSelected,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Expanded(
-      child: InkWell(
-        onTap: () {
-          unawaited(WaveController.toggleStation(seed));
-        },
-        borderRadius: BorderRadius.circular(20),
-        child: Container(
-          height: 90,
-          decoration: BoxDecoration(
-            color: isSelected
-                ? Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.1)
-                : Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.05),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: isSelected
-                  ? Theme.of(
-                      context,
-                    ).colorScheme.onSurface.withValues(alpha: 0.3)
-                  : Theme.of(
-                      context,
-                    ).colorScheme.onSurface.withValues(alpha: 0.1),
-            ),
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, color: color, size: 28),
-              const SizedBox(height: 8),
-              Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: isSelected
-                      ? Theme.of(context).colorScheme.onSurface
-                      : Theme.of(context).colorScheme.onSurfaceVariant,
-                  fontWeight: isSelected ? FontWeight.w900 : FontWeight.bold,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _MoodCircle extends StatelessWidget {
-  final _MoodItem mood;
-  final VoidCallback onSelected;
-  final bool isSelected;
-  const _MoodCircle({
-    required this.mood,
-    required this.onSelected,
-    required this.isSelected,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: () {
-        unawaited(WaveController.toggleStation(mood.seed));
-      },
-      borderRadius: BorderRadius.circular(40),
-      child: Column(
-        children: [
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 200),
-            width: isSelected ? 56 : 50,
-            height: isSelected ? 56 : 50,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: isSelected
-                  ? Border.all(
-                      color: Theme.of(context).colorScheme.onSurface,
-                      width: 2,
-                    )
-                  : null,
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: mood.colors,
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: mood.colors[0].withValues(
-                    alpha: isSelected ? 0.6 : 0.4,
-                  ),
-                  blurRadius: isSelected ? 15 : 10,
-                  spreadRadius: isSelected ? 3 : 1,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            mood.label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: isSelected
-                  ? Theme.of(context).colorScheme.onSurface
-                  : Theme.of(context).colorScheme.onSurfaceVariant,
-              fontWeight: isSelected ? FontWeight.w900 : FontWeight.w600,
-              fontSize: 11,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _AllStationsSheet extends StatefulWidget {
-  const _AllStationsSheet();
-
-  @override
-  State<_AllStationsSheet> createState() => _AllStationsSheetState();
-}
-
-class _AllStationsSheetState extends State<_AllStationsSheet> {
-  final FlutterSignal<String> _searchQuery = signal('');
-  final _controller = TextEditingController();
-  final _scrollController = ScrollController();
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    _scrollController.dispose();
-    super.dispose();
-  }
+class _WaveAside extends StatelessWidget {
+  const _WaveAside();
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final stationsFuture = waveStationsSignal.value;
-        if (stationsFuture.isLoading) {
-          return const Center(child: M3ELoadingIndicator());
-        }
+        final seeds = currentWaveSeedsSignal();
+        final queue = queueTracksSignal().value ?? const <SimpleTrackDto>[];
+        final index = playerStateSignal()?.queueIndex ?? 0;
+        final upcoming = _isWaveActive(seeds)
+            ? queue.skip(index + 1).take(3).toList()
+            : const <SimpleTrackDto>[];
 
-        final currentSeeds = currentWaveSeedsSignal();
-        var cats = stationsFuture.value ?? [];
-        final query = _searchQuery().toLowerCase();
-
-        if (query.isNotEmpty) {
-          cats = cats
-              .map(
-                (cat) => StationCategoryDto(
-                  title: cat.title,
-                  items: cat.items
-                      .where((i) => i.label.toLowerCase().contains(query))
-                      .toList(),
-                ),
-              )
-              .where((cat) => cat.items.isNotEmpty)
-              .toList();
-        }
-
-        return Container(
-          height: MediaQuery.of(context).size.height * 0.8,
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-            borderRadius: const BorderRadius.vertical(
-              top: Radius.circular(24),
-            ),
-          ),
-          child: SafeArea(
-            child: Column(
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
               children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
-                  child: Row(
-                    children: [
-                      Text(
-                        'Каталог станций',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.onSurface,
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        icon: Icon(
-                          Icons.close,
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
-                        onPressed: () => Navigator.pop(context),
-                      ),
-                    ],
+                Expanded(child: Text('Настройки волны', style: GText.sm(weight: GText.medium))),
+                if (seeds.any((s) => s != _defaultSeed))
+                  GTextAction(
+                    label: 'Сбросить',
+                    style: GText.xs(),
+                    onPressed: () => unawaited(WaveController.resetStations()),
                   ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 8,
-                  ),
-                  child: TextField(
-                    controller: _controller,
-                    onChanged: (v) => _searchQuery.value = v,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.onSurface,
+              ],
+            ),
+            const SizedBox(height: 20),
+            for (final group in waveGroups) ...[
+              Text(group.label, style: GText.xs(color: GColors.mutedForeground)),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final o in group.options)
+                    GChip(
+                      label: o.label,
+                      active: seeds.contains(o.seed),
+                      onPressed: () => unawaited(WaveController.toggleStation(o.seed)),
                     ),
-                    decoration: InputDecoration(
-                      hintText: 'Поиск по жанрам, настроениям...',
-                      hintStyle: TextStyle(
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
-                      ),
-                      prefixIcon: Icon(
-                        Icons.search,
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
-                      ),
-                      filled: true,
-                      fillColor: Theme.of(
-                        context,
-                      ).colorScheme.onSurface.withValues(alpha: 0.05),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
-                      ),
-                      contentPadding: EdgeInsets.zero,
-                    ),
-                  ),
-                ),
-                Expanded(
-                  child: cats.isEmpty && query.isNotEmpty
-                      ? Center(
-                          child: Text(
-                            'Ничего не найдено',
-                            style: TextStyle(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        )
-                      : Scrollbar(
-                          controller: _scrollController,
-                          child: CustomScrollView(
-                            scrollCacheExtent: const ScrollCacheExtent.pixels(
-                              1000,
-                            ),
-                            controller: _scrollController,
-                            slivers: [
-                              for (final cat in cats) ...[
-                                SliverPadding(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    24,
-                                    24,
-                                    24,
-                                    12,
-                                  ),
-                                  sliver: SliverToBoxAdapter(
-                                    child: Text(
-                                      cat.title.toUpperCase(),
-                                      style: TextStyle(
-                                        color:
-                                            Theme.of(
-                                                  context,
-                                                ).colorScheme.onSurfaceVariant
-                                                .withValues(alpha: 0.6),
-                                        fontWeight: FontWeight.bold,
-                                        letterSpacing: 1.2,
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                SliverPadding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 24,
-                                  ),
-                                  sliver: SliverToBoxAdapter(
-                                    child: Wrap(
-                                      spacing: 8,
-                                      runSpacing: 8,
-                                      children: cat.items.map((item) {
-                                        final isSelected = currentSeeds
-                                            .contains(
-                                              item.seed,
-                                            );
-                                        final maxSheetLabelWidth =
-                                            MediaQuery.sizeOf(context).width -
-                                            48 -
-                                            40; // Subtract modal padding and chip padding
-                                        return FilterChip(
-                                          selected: isSelected,
-                                          label: ConstrainedBox(
-                                            constraints: BoxConstraints(
-                                              maxWidth: maxSheetLabelWidth > 0
-                                                  ? maxSheetLabelWidth
-                                                  : 100,
-                                            ),
-                                            child: Text(
-                                              item.label,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                          ),
-                                          onSelected: (_) {
-                                            unawaited(
-                                              WaveController.toggleStation(
-                                                item.seed,
-                                              ),
-                                            );
-                                            Navigator.pop(context);
-                                          },
-                                          backgroundColor:
-                                              Theme.of(
-                                                    context,
-                                                  ).colorScheme.onSurface
-                                                  .withValues(
-                                                    alpha: 0.05,
-                                                  ),
-                                          selectedColor:
-                                              Theme.of(
-                                                    context,
-                                                  ).colorScheme.onSurface
-                                                  .withValues(
-                                                    alpha: 0.2,
-                                                  ),
-                                          labelStyle: TextStyle(
-                                            color: isSelected
-                                                ? Theme.of(
-                                                    context,
-                                                  ).colorScheme.onSurface
-                                                : Theme.of(
-                                                        context,
-                                                      )
-                                                      .colorScheme
-                                                      .onSurfaceVariant,
-                                            fontWeight: isSelected
-                                                ? FontWeight.w900
-                                                : FontWeight.w600,
-                                            fontSize: 12,
-                                          ),
-                                          shape: RoundedRectangleBorder(
-                                            borderRadius: BorderRadius.circular(
-                                              20,
-                                            ),
-                                          ),
-                                          side: isSelected
-                                              ? BorderSide(
-                                                  color:
-                                                      Theme.of(
-                                                            context,
-                                                          )
-                                                          .colorScheme
-                                                          .onSurface
-                                                          .withValues(
-                                                            alpha: 0.24,
-                                                          ),
-                                                )
-                                              : BorderSide.none,
-                                          showCheckmark: false,
-                                        );
-                                      }).toList(),
-                                    ),
-                                  ),
-                                ),
-                              ],
-                              const SliverPadding(
-                                padding: EdgeInsets.only(bottom: 40),
+                ],
+              ),
+              const SizedBox(height: 24),
+            ],
+            GButton(
+              label: 'Все станции',
+              icon: LucideIcons.radio,
+              variant: GButtonVariant.secondary,
+              size: GButtonSize.sm,
+              onPressed: () => unawaited(_showAllStations(context)),
+            ),
+            const SizedBox(height: 32),
+            Text('Дальше в волне', style: GText.sm(weight: GText.medium)),
+            const SizedBox(height: 16),
+            if (upcoming.isEmpty)
+              Text(
+                'Появится, когда волна заиграет.',
+                style: GText.xs(color: GColors.mutedForeground),
+              )
+            else
+              for (final t in upcoming)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Opacity(
+                    opacity: 0.8,
+                    child: Row(
+                      children: [
+                        GCover(url: t.coverUrl, size: 40, radius: GRadius.md),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(trackTitle(t), maxLines: 1, overflow: TextOverflow.ellipsis, style: GText.sm()),
+                              Text(
+                                artistNames(t.artists),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GText.xs(color: GColors.mutedForeground),
                               ),
                             ],
                           ),
                         ),
+                      ],
+                    ),
+                  ),
                 ),
-              ],
-            ),
-          ),
+          ],
         );
       },
     );
   }
+}
+
+Future<void> _showAllStations(BuildContext context) {
+  return showGDialog<void>(
+    context,
+    builder: (context) => GDialog(
+      title: 'Все станции',
+      description: 'Станция заменит текущие настройки волны.',
+      width: 640,
+      content: SignalBuilder(
+        builder: (context) {
+          final async = waveStationsSignal();
+          final cats = async.value ?? const <StationCategoryDto>[];
+          final seeds = currentWaveSeedsSignal();
+          if (cats.isEmpty) {
+            return async.isLoading
+                ? const GLoader()
+                : GEmptyState(
+                    icon: LucideIcons.radio,
+                    title: 'Станции не загрузились',
+                    action: GButton(
+                      label: 'Повторить',
+                      variant: GButtonVariant.secondary,
+                      onPressed: () => unawaited(WaveController.refresh()),
+                    ),
+                    compact: true,
+                  );
+          }
+          return SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final c in cats) ...[
+                  Text(c.title, style: GText.xs(color: GColors.mutedForeground)),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final i in c.items)
+                        GChip(
+                          label: i.label,
+                          active: seeds.contains(i.seed),
+                          onPressed: () {
+                            unawaited(WaveController.playStation(i.seed));
+                            Navigator.of(context).pop();
+                          },
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                ],
+              ],
+            ),
+          );
+        },
+      ),
+    ),
+  );
 }

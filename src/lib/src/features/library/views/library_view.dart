@@ -1,21 +1,28 @@
 import 'dart:async';
 
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
 import 'package:youmuz/src/features/core/providers/notification_provider.dart';
-import 'package:youmuz/src/features/core/theme/app_tokens.dart';
-import 'package:youmuz/src/features/core/views/widgets/app_context_menu.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
 import 'package:youmuz/src/features/core/views/widgets/download_menu.dart';
-import 'package:youmuz/src/features/core/views/widgets/media_card.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_elements.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_tile.dart';
+import 'package:youmuz/src/features/core/views/widgets/media_tile.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_actions.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_row.dart';
 import 'package:youmuz/src/features/library/providers/library_provider.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
+enum _Tab { tracks, playlists, albums, artists }
+
+const _tabLabels = {
+  _Tab.tracks: 'Мне нравится',
+  _Tab.playlists: 'Плейлисты',
+  _Tab.albums: 'Альбомы',
+  _Tab.artists: 'Исполнители',
+};
+
+/// "Коллекция": liked tracks, playlists, albums and artists of the account.
 class LibraryView extends StatefulWidget {
   const LibraryView({super.key});
 
@@ -23,482 +30,239 @@ class LibraryView extends StatefulWidget {
   State<LibraryView> createState() => _LibraryViewState();
 }
 
-class _LibraryViewState extends State<LibraryView>
-    with SingleTickerProviderStateMixin {
-  late TabController _tabController;
-  final TextEditingController _searchController = TextEditingController();
+class _LibraryViewState extends State<LibraryView> {
+  _Tab _tab = _Tab.tracks;
+  final _searchController = TextEditingController();
+  EffectCleanup? _requestSync;
+  final Set<_Tab> _loaded = {};
 
   @override
   void initState() {
     super.initState();
-    final currentSection = navStackSignal.value.last.section;
-    final initialIndex = currentSection == AppSection.playlists ? 1 : 0;
-    _tabController = TabController(
-      length: 4,
-      vsync: this,
-      initialIndex: initialIndex,
-    );
     _searchController.text = librarySearchQuerySignal.value;
-    // Deliberately no `TabController`/`TextEditingController` listeners that
-    // call `setState`: the tab one also fires on `offset` during a swipe (so
-    // every drag frame rebuilt the header, the TabBar and all four tabs), and
-    // the text one rebuilt them on every keystroke just to toggle a clear
-    // button. `AppLayout` builds every root section up front (only `Offstage`),
-    // so `initState` here runs on every cold start — fetching four collections
-    // for tabs the user may never open.
-    unawaited(
-      refreshLikedTracks(
-        query: _searchController.text.isEmpty ? null : _searchController.text,
-      ),
-    );
-    unawaited(refreshPlaylists());
+    _requestSync = effect(() {
+      final requested = librarySectionRequestSignal();
+      final tab = requested == AppSection.playlists ? _Tab.playlists : _Tab.tracks;
+      if (mounted && tab != _tab) setState(() => _tab = tab);
+      _ensureLoaded(tab);
+    });
+  }
+
+  void _ensureLoaded(_Tab tab) {
+    if (!_loaded.add(tab)) return;
+    switch (tab) {
+      case _Tab.tracks:
+        unawaited(refreshLikedTracks(query: librarySearchQuerySignal.value.isEmpty ? null : librarySearchQuerySignal.value));
+      case _Tab.playlists:
+        unawaited(refreshPlaylists());
+      case _Tab.albums:
+        unawaited(refreshLikedAlbums());
+      case _Tab.artists:
+        unawaited(refreshLikedArtists());
+    }
+  }
+
+  void _select(_Tab tab) {
+    setState(() => _tab = tab);
+    _ensureLoaded(tab);
   }
 
   @override
   void dispose() {
-    _tabController.dispose();
+    _requestSync?.call();
     _searchController.dispose();
     super.dispose();
   }
 
-  void _showCreatePlaylistDialog(BuildContext context) {
-    final controller = TextEditingController();
-    var isPublic = false;
-
-    unawaited(
-      showDialog<void>(
-        context: context,
-        builder: (context) => StatefulBuilder(
-          builder: (context, setState) {
-            final cs = Theme.of(context).colorScheme;
-            return AppDialog(
-              title: 'Новый плейлист',
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(
-                    controller: controller,
-                    autofocus: true,
-                    style: TextStyle(color: cs.onSurface),
-                    decoration: InputDecoration(
-                      hintText: 'Название',
-                      hintStyle: TextStyle(
-                        color: cs.onSurface.withValues(alpha: 0.24),
-                      ),
-                      filled: true,
-                      fillColor: cs.onSurface.withValues(alpha: 0.05),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(AppRadius.sm),
-                        borderSide: BorderSide.none,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  SwitchListTile(
-                    title: Text(
-                      'Публичный',
-                      style: TextStyle(color: cs.onSurfaceVariant),
-                    ),
-                    value: isPublic,
-                    onChanged: (val) => setState(() => isPublic = val),
-                  ),
-                ],
-              ),
-              actions: [
-                AppDialog.cancelButton(context),
-                ElevatedButton(
-                  onPressed: () async {
-                    if (controller.text.isNotEmpty) {
-                      final success = await createPlaylistAction(
-                        controller.text,
-                        isPublic: isPublic,
-                      );
-                      if (!context.mounted) return;
-                      Navigator.pop(context);
-                      if (!success) {
-                        showAppError('Ошибка при создании плейлиста');
-                      } else {
-                        showAppSuccess(
-                          'Плейлист "${controller.text}" создан',
-                        );
-                      }
-                    }
-                  },
-                  child: const Text('Создать'),
-                ),
-              ],
-            );
-          },
-        ),
-      ).whenComplete(controller.dispose),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: EdgeInsets.fromLTRB(
-            isNarrow ? 20 : 40,
-            isNarrow ? 16 : 40,
-            isNarrow ? 20 : 40,
-            isNarrow ? 8 : 20,
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Библиотека',
-                  style:
-                      Theme.of(
-                        context,
-                      ).textTheme.displayMedium?.copyWith(
-                        fontSize: isNarrow ? 24 : 48,
-                        fontWeight: FontWeight.w900,
-                        color: Theme.of(context).colorScheme.onSurface,
-                        letterSpacing: -1.5,
-                        height: 1.05,
-                      ),
-                ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final padding = GLayout.pagePadding(constraints.maxWidth);
+        final header = Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Коллекция', style: GText.headline(constraints.maxWidth >= 768 ? 36 : 30)),
+            const SizedBox(height: 20),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final t in _Tab.values) ...[
+                    GNavPill(label: _tabLabels[t]!, active: _tab == t, onPressed: () => _select(t)),
+                    const SizedBox(width: 4),
+                  ],
+                ],
               ),
-              const SizedBox(width: 16),
-              M3EButton.icon(
-                onPressed: () => _showCreatePlaylistDialog(context),
-                icon: const Icon(Icons.add_rounded),
-                label: isNarrow
-                    ? const SizedBox.shrink()
-                    : const Text('Создать плейлист'),
-                style: M3EButtonStyle.outlined,
-                // In icon-only mode the package still inserts the icon-label
-                // gap, which pushes the icon off-center; drop the gap.
-                size: isNarrow
-                    ? M3EButtonSize.fromBase(M3EButtonSize.sm, iconGap: 0)
-                    : M3EButtonSize.md,
-                decoration: M3EButtonDecoration.styleFrom(
-                  foregroundColor: Theme.of(context).colorScheme.primary,
-                ),
-              ),
-            ],
-          ),
-        ),
-        TabBar(
-          controller: _tabController,
-          isScrollable: true,
-          tabAlignment: TabAlignment.start,
-          padding: EdgeInsets.symmetric(horizontal: isNarrow ? 20 : 40),
-          indicator: UnderlineTabIndicator(
-            borderRadius: BorderRadius.circular(4),
-            borderSide: BorderSide(
-              width: 3,
-              color: Theme.of(context).colorScheme.primary,
             ),
-          ),
-          splashBorderRadius: BorderRadius.circular(12),
-          labelColor: Theme.of(context).colorScheme.onSurface,
-          unselectedLabelColor: Theme.of(context).colorScheme.onSurfaceVariant,
-          dividerColor: Colors.transparent,
-          tabs: const [
-            Tab(text: 'Любимые треки'),
-            Tab(text: 'Плейлисты'),
-            Tab(text: 'Любимые альбомы'),
-            Tab(text: 'Любимые исполнители'),
+            const SizedBox(height: 24),
           ],
-        ),
-        Expanded(
-          child: TabBarView(
-            controller: _tabController,
-            children: [
-              _LikedTracksTab(searchController: _searchController),
-              const _PlaylistsTab(),
-              _LikedAlbumsTab(
-                // Fetch on first display, not at startup: the other two
-                // collections were loaded from `initState` on every cold start
-                // even though the user may never open those tabs.
-                onFirstShown: () {
-                  if (likedAlbumsSignal.value.isEmpty) {
-                    unawaited(refreshLikedAlbums());
-                  }
-                },
+        );
+
+        final body = switch (_tab) {
+          _Tab.tracks => _LikedTracks(searchController: _searchController),
+          _Tab.playlists => const _Playlists(),
+          _Tab.albums => const _Albums(),
+          _Tab.artists => const _Artists(),
+        };
+
+        return Scrollbar(
+          child: CustomScrollView(
+            primary: true,
+            slivers: [
+              SliverToBoxAdapter(
+                child: GPageFrame(
+                  padding: EdgeInsets.fromLTRB(padding.left, padding.top, padding.right, 0),
+                  child: header,
+                ),
               ),
-              _LikedArtistsTab(
-                onFirstShown: () {
-                  if (likedArtistsSignal.value.isEmpty) {
-                    unawaited(refreshLikedArtists());
-                  }
-                },
+              SliverPadding(
+                padding: EdgeInsets.fromLTRB(
+                  (constraints.maxWidth - GLayout.maxContentWidth).clamp(0, double.infinity) / 2 + padding.left,
+                  0,
+                  (constraints.maxWidth - GLayout.maxContentWidth).clamp(0, double.infinity) / 2 + padding.right,
+                  48,
+                ),
+                sliver: body,
               ),
             ],
           ),
-        ),
-      ],
+        );
+      },
     );
   }
 }
 
-class _LikedTracksTab extends StatefulWidget {
+class _LikedTracks extends StatelessWidget {
+  const _LikedTracks({required this.searchController});
+
   final TextEditingController searchController;
-  const _LikedTracksTab({required this.searchController});
 
-  @override
-  State<_LikedTracksTab> createState() => _LikedTracksTabState();
-}
-
-class _LikedTracksTabState extends State<_LikedTracksTab> {
-  Future<void> _downloadLikedTracks(
-    List<SimpleTrackDto> tracks,
-    DownloadMode mode,
-  ) async {
-    showAppSuccess('Скачивание ${tracks.length} треков началось...');
+  Future<void> _download(List<SimpleTrackDto> tracks, DownloadMode mode) async {
+    showAppSuccess('Скачивание ${tracks.length} ${plural(tracks.length, 'трека', 'треков', 'треков')} началось...');
     try {
-      final paths = await downloadLikedTracksAction(
-        tracks,
-        toCache: mode == DownloadMode.cache,
-      );
-      if (!mounted) return;
+      final paths = await downloadLikedTracksAction(tracks, toCache: mode == DownloadMode.cache);
       showAppSuccess(
-        mode == DownloadMode.cache
-            ? '\u041b\u044e\u0431\u0438\u043c\u044b\u0435 \u0442\u0440\u0435\u043a\u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u044b \u0432 \u043a\u044d\u0448'
-            : '\u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0444\u0430\u0439\u043b\u043e\u0432: ${paths.length}',
+        mode == DownloadMode.cache ? 'Любимые треки сохранены в кэш' : 'Сохранено файлов: ${paths.length}',
       );
     } on Object catch (e) {
-      if (!mounted) return;
       showAppError('Ошибка при скачивании: $e');
     }
   }
 
-  Future<void> _deleteAllLikedTracks(List<SimpleTrackDto> tracks) async {
+  Future<void> _deleteDownloaded(BuildContext context, List<SimpleTrackDto> tracks) async {
+    final ok = await showGConfirm(
+      context,
+      title: 'Удалить всё?',
+      message: 'Удалить все скачанные любимые треки из кэша приложения?',
+      confirmLabel: 'Удалить',
+      destructive: true,
+    );
+    if (!ok) return;
     try {
       final deleted = await deleteAllLikedTracksAction(tracks);
-      if (!mounted) return;
-      if (deleted > 0) {
-        showAppSuccess('Удалено треков: $deleted');
-      }
+      if (deleted > 0) showAppSuccess('Удалено треков: $deleted');
     } on Object catch (e) {
-      if (!mounted) return;
       showAppError('Ошибка при удалении: $e');
     }
   }
 
-  void _showDeleteAllConfirmation(
-    BuildContext context,
-    List<SimpleTrackDto> tracks,
-  ) {
-    unawaited(
-      showDialog<void>(
-        context: context,
-        builder: (context) {
-          final cs = Theme.of(context).colorScheme;
-          return AppDialog(
-            title: 'Удалить всё?',
-            content: Text(
-              'Вы действительно хотите удалить все скачанные любимые треки?',
-              style: TextStyle(color: cs.onSurfaceVariant),
-            ),
-            actions: [
-              AppDialog.cancelButton(context),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: cs.error,
-                  foregroundColor: cs.onError,
-                ),
-                onPressed: () {
-                  Navigator.pop(context);
-                  unawaited(_deleteAllLikedTracks(tracks));
-                },
-                child: const Text('Удалить'),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
-
     return SignalBuilder(
       builder: (context) {
-        final cs = Theme.of(context).colorScheme;
-        final tracks = likedTracksSignal.value;
-        final query = librarySearchQuerySignal.value;
+        final tracks = likedTracksSignal();
+        final loading = isLibraryLoadingSignal();
+        final downloaded = downloadedTracksSignal();
+        final busy = isDownloadingAllLikedTracksSignal();
+        final query = librarySearchQuerySignal();
+        final anyDownloaded = tracks.any((t) => downloaded.contains(t.id));
+        final totalMs = tracks.fold<int>(0, (a, t) => a + t.durationMs);
 
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: EdgeInsets.fromLTRB(
-                isNarrow ? 20 : 40,
-                8,
-                isNarrow ? 20 : 40,
-                16,
+        final toolbar = Padding(
+          padding: const EdgeInsets.only(bottom: 16),
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SizedBox(
+                width: 280,
+                child: GSearchField(
+                  controller: searchController,
+                  placeholder: 'Поиск в «Мне нравится»',
+                  onChanged: setLibrarySearchQuery,
+                ),
               ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: widget.searchController,
-                      onChanged: setLibrarySearchQuery,
-                      style: TextStyle(
-                        color: cs.onSurface,
-                        fontSize: 14,
-                      ),
-                      decoration: InputDecoration(
-                        hintText: 'Поиск в любимых треках...',
-                        hintStyle: TextStyle(
-                          color: cs.onSurface.withValues(alpha: 0.24),
-                        ),
-                        prefixIcon: Icon(
-                          Icons.search,
-                          color: cs.onSurface.withValues(alpha: 0.38),
-                          size: 20,
-                        ),
-                        // Scoped to the suffix only: rebuilding the whole
-                        // library view on every keystroke (which is what the
-                        // old `setState`-per-keystroke listener did) is not
-                        // needed just to toggle this icon.
-                        suffixIcon: ValueListenableBuilder<TextEditingValue>(
-                          valueListenable: widget.searchController,
-                          builder: (context, value, _) {
-                            if (value.text.isEmpty) return const SizedBox.shrink();
-                            return IconButton(
-                              icon: Icon(
-                                Icons.clear,
-                                color: cs.onSurface.withValues(alpha: 0.38),
-                                size: 18,
-                              ),
-                              onPressed: () {
-                                widget.searchController.clear();
-                                setLibrarySearchQuery('');
-                              },
-                            );
-                          },
-                        ),
-                        filled: true,
-                        fillColor: cs.onSurface.withValues(alpha: 0.05),
-                        isDense: true,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(AppRadius.sm),
-                          borderSide: BorderSide.none,
-                        ),
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
-                        ),
-                      ),
-                    ),
+              GButton(
+                label: 'Слушать',
+                glyph: GGlyphKind.play,
+                onPressed: tracks.isEmpty ? null : () => unawaited(PlaybackController.playLikedTrack(tracks.first.id)),
+              ),
+              GMenu(
+                items: () => [
+                  GMenuItem(
+                    label: 'В кэш приложения',
+                    icon: LucideIcons.hardDriveDownload,
+                    onSelected: () => unawaited(_download(tracks, DownloadMode.cache)),
                   ),
-                  const SizedBox(width: 12),
-                  SignalBuilder(
-                    builder: (context) {
-                      final isDownloading =
-                          isDownloadingAllLikedTracksSignal.value;
-                      final downloadedTracks = downloadedTracksSignal.value;
-                      final allDownloaded =
-                          tracks.isNotEmpty &&
-                          tracks.every((t) => downloadedTracks.contains(t.id));
-
-                      if (allDownloaded) {
-                        return _LikedTracksCompletedActions(
-                          onSelected: (mode) => unawaited(
-                            _downloadLikedTracks(tracks, mode),
-                          ),
-                          onPressed: () =>
-                              _showDeleteAllConfirmation(context, tracks),
-                          icon: const Icon(Icons.delete_sweep_rounded),
-                          tooltip: 'Удалить всё из кэша',
-                          style: IconButton.styleFrom(
-                            backgroundColor: cs.onSurface.withValues(
-                              alpha: 0.05,
-                            ),
-                            foregroundColor: cs.error,
-                          ),
-                        );
-                      }
-
-                      return _LikedTracksDownloadButton(
-                        onSelected: (mode) => unawaited(
-                          _downloadLikedTracks(tracks, mode),
-                        ),
-                        onPressed: isDownloading || tracks.isEmpty
-                            ? null
-                            : () {},
-                        icon: isDownloading
-                            ? const M3ECircularWavyProgressIndicator(
-                                strokeWidth: 2,
-                                size: 20,
-                              )
-                            : const Icon(Icons.download_rounded),
-                        tooltip: 'Скачать всё',
-                        style: IconButton.styleFrom(
-                          backgroundColor: cs.onSurface.withValues(alpha: 0.05),
-                          foregroundColor: Theme.of(
-                            context,
-                          ).colorScheme.primary,
-                        ),
-                      );
-                    },
+                  GMenuItem(
+                    label: 'В отдельные файлы',
+                    icon: LucideIcons.fileMusic,
+                    onSelected: () => unawaited(_download(tracks, DownloadMode.files)),
                   ),
                 ],
+                builder: (context, menu) => GCircleButton(
+                  icon: LucideIcons.download,
+                  tooltip: busy ? 'Скачивание…' : 'Скачать всё',
+                  onPressed: tracks.isEmpty || busy ? null : () => menu.open(),
+                ),
               ),
-            ),
-            Expanded(
-              child: tracks.isEmpty
-                  ? Center(
-                      child: Text(
-                        query.isEmpty
-                            ? 'Нет любимых треков'
-                            : 'Ничего не найдено',
-                        style: TextStyle(
-                          color: cs.onSurface.withValues(alpha: 0.38),
-                        ),
-                      ),
-                    )
-                  : M3ESegmentedList.builder(
-                      haptic: M3EHapticFeedback.light,
-                      itemCount: tracks.length,
-                      listPadding: const EdgeInsets.only(bottom: 140),
-                      margin: EdgeInsets.symmetric(
-                        horizontal: isNarrow ? 0 : 40,
-                      ),
-                      color: Colors.transparent,
-                      padding: EdgeInsets.symmetric(
-                        horizontal: isNarrow ? 0 : 40,
-                        vertical: 8,
-                      ),
-                      itemBuilder: (context, index) {
-                        final track = tracks[index];
-                        return CommonTrackTile(
-                          trackId: track.id,
-                          title: track.title,
-                          version: track.version,
-                          artists: track.artists,
-                          albumId: track.albumId,
-                          leading: TrackCover(url: track.coverUrl),
-                          trailing: Text(
-                            formatDuration(track.durationMs),
-                            style: TextStyle(
-                              color: cs.onSurface.withValues(alpha: 0.38),
-                            ),
-                          ),
-                          onTap: () => unawaited(
-                            PlaybackController.playLikedTrack(track.id),
-                          ),
-                          onTitleTap: () {
-                            if (track.albumId != null) {
-                              navigateTo(AppSection.album, track.albumId);
-                            }
-                          },
-                        );
-                      },
-                    ),
+              if (anyDownloaded)
+                GCircleButton(
+                  icon: LucideIcons.trash2,
+                  tooltip: 'Удалить всё из кэша',
+                  onPressed: () => unawaited(_deleteDownloaded(context, tracks)),
+                ),
+              if (tracks.isNotEmpty)
+                Text(
+                  '${tracks.length} ${plural(tracks.length, 'трек', 'трека', 'треков')} · ${formatTotalDuration(totalMs)}',
+                  style: GText.xs(color: GColors.mutedForeground),
+                ),
+            ],
+          ),
+        );
+
+        if (tracks.isEmpty) {
+          return SliverList.list(
+            children: [
+              toolbar,
+              if (loading)
+                const GLoader()
+              else
+                GEmptyState(
+                  icon: LucideIcons.heart,
+                  title: query.isEmpty ? 'Здесь будут ваши любимые треки' : 'Ничего не найдено',
+                  message: query.isEmpty ? 'Нажмите на сердечко у трека, чтобы добавить его сюда.' : null,
+                ),
+            ],
+          );
+        }
+
+        return SliverMainAxisGroup(
+          slivers: [
+            SliverToBoxAdapter(child: toolbar),
+            const SliverToBoxAdapter(child: TrackListHeader()),
+            SliverList.builder(
+              itemCount: tracks.length,
+              itemBuilder: (context, i) {
+                final t = tracks[i];
+                return TrackRow(
+                  key: ValueKey('liked_${t.id}'),
+                  track: t,
+                  onPlay: () => unawaited(PlaybackController.playLikedTrack(t.id)),
+                );
+              },
             ),
           ],
         );
@@ -507,443 +271,184 @@ class _LikedTracksTabState extends State<_LikedTracksTab> {
   }
 }
 
-class _LikedTracksCompletedActions extends StatelessWidget {
-  final VoidCallback? onPressed;
-  final Widget icon;
-  final String tooltip;
-  final ButtonStyle? style;
-  final void Function(DownloadMode mode) onSelected;
+class _Playlists extends StatelessWidget {
+  const _Playlists();
 
-  const _LikedTracksCompletedActions({
-    required this.onPressed,
-    required this.icon,
-    required this.tooltip,
-    required this.style,
-    required this.onSelected,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        IconButton(
-          onPressed: onPressed,
-          icon: icon,
-          tooltip: tooltip,
-          style: style,
-        ),
-        DownloadTargetMenu(
-          compact: true,
-          isLoading: false,
-          onSelected: onSelected,
-        ),
-      ],
+  Future<void> _create(BuildContext context) async {
+    final title = await showGPrompt(
+      context,
+      title: 'Новый плейлист',
+      placeholder: 'Название',
+      confirmLabel: 'Создать',
     );
+    if (title == null) return;
+    final ok = await createPlaylistAction(title, isPublic: false);
+    ok ? showAppSuccess('Плейлист создан') : showAppError('Не удалось создать плейлист');
   }
-}
-
-class _LikedTracksDownloadButton extends StatelessWidget {
-  final VoidCallback? onPressed;
-  final Widget icon;
-  final String tooltip;
-  final ButtonStyle? style;
-  final void Function(DownloadMode mode) onSelected;
-
-  const _LikedTracksDownloadButton({
-    required this.onPressed,
-    required this.icon,
-    required this.tooltip,
-    required this.style,
-    required this.onSelected,
-  });
 
   @override
   Widget build(BuildContext context) {
-    final isEnabled = onPressed != null;
-    return IgnorePointer(
-      ignoring: !isEnabled,
-      child: AppContextMenu<DownloadMode>(
-        items: const [
-          AppContextMenuItem(
-            value: DownloadMode.cache,
-            label: 'В кэш приложения',
-            icon: Icons.offline_bolt_rounded,
-          ),
-          AppContextMenuItem(
-            value: DownloadMode.files,
-            label: 'В отдельные файлы',
-            icon: Icons.file_download_rounded,
-          ),
-          /*
-          AppContextMenuItem(
-            value: DownloadMode.cache,
-            label: 'Р’ РєСЌС€ РїСЂРёР»РѕР¶РµРЅРёСЏ',
-            icon: Icons.offline_bolt_rounded,
-          ),
-          AppContextMenuItem(
-            value: DownloadMode.files,
-            label: 'Р’ РѕС‚РґРµР»СЊРЅС‹Рµ С„Р°Р№Р»С‹',
-            icon: Icons.file_download_rounded,
-          ),
-          */
-        ],
-        onSelected: onSelected,
-        child: IgnorePointer(
-          child: IconButton(
-            onPressed: onPressed,
-            icon: icon,
-            tooltip: tooltip,
-            style: style,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _PlaylistsTab extends StatelessWidget {
-  const _PlaylistsTab();
-
-  @override
-  Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
-
     return SignalBuilder(
       builder: (context) {
-        final playlists = playlistsSignal.value;
-
-        if (playlists.isEmpty) {
-          return Center(
-            child: Text(
-              'Нет плейлистов',
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurface.withValues(
-                  alpha: 0.38,
-                ),
+        final playlists = playlistsSignal();
+        final liked = likedTracksSignal();
+        return SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              GButton(
+                label: 'Новый плейлист',
+                icon: LucideIcons.plus,
+                variant: GButtonVariant.secondary,
+                onPressed: () => unawaited(_create(context)),
               ),
-            ),
-          );
-        }
-
-        return GridView.builder(
-          padding: EdgeInsets.fromLTRB(
-            isNarrow ? 20 : 40,
-            isNarrow ? 20 : 40,
-            isNarrow ? 20 : 40,
-            140,
+              const SizedBox(height: 24),
+              MediaGrid(
+                children: [
+                  MediaTile(
+                    title: 'Мне нравится',
+                    subtitle: liked.isEmpty ? 'Ваши лайки' : '${liked.length} ${plural(liked.length, 'трек', 'трека', 'треков')}',
+                    cover: const LikedCover(),
+                    onTap: () => navigateTo(AppSection.liked),
+                  ),
+                  for (final p in playlists.where((p) => p.kind != 3))
+                    MediaTile(
+                      title: p.title,
+                      subtitle: [
+                        '${p.trackCount} ${plural(p.trackCount, 'трек', 'трека', 'треков')}',
+                        if (!p.isPublic) 'приватный',
+                      ].join(' · '),
+                      coverUrl: p.coverUrl,
+                      icon: LucideIcons.listMusic,
+                      onTap: () => navigateTo(AppSection.playlist, '${p.uid}:${p.kind}'),
+                      menu: () => [
+                        GMenuItem(
+                          label: 'Слушать',
+                          icon: LucideIcons.play,
+                          onSelected: () => unawaited(PlaybackController.playPlaylist('${p.uid}', p.kind)),
+                        ),
+                        GMenuItem(
+                          label: 'Открыть',
+                          icon: LucideIcons.arrowUpRight,
+                          onSelected: () => navigateTo(AppSection.playlist, '${p.uid}:${p.kind}'),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ],
           ),
-          gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-            maxCrossAxisExtent: isNarrow ? 180 : 200,
-            mainAxisSpacing: isNarrow ? 16 : 24,
-            crossAxisSpacing: isNarrow ? 16 : 24,
-            childAspectRatio: isNarrow ? 0.7 : 0.75,
-          ),
-          itemCount: playlists.length,
-          itemBuilder: (context, index) {
-            final playlist = playlists[index];
-            return _PlaylistCard(playlist: playlist);
-          },
         );
       },
     );
   }
 }
 
-class _LikedAlbumsTab extends StatefulWidget {
-  /// Fired once, on the first build after the tab becomes visible.
-  final VoidCallback onFirstShown;
-
-  const _LikedAlbumsTab({required this.onFirstShown});
-
-  @override
-  State<_LikedAlbumsTab> createState() => _LikedAlbumsTabState();
-}
-
-class _LikedAlbumsTabState extends State<_LikedAlbumsTab> {
-  @override
-  void initState() {
-    super.initState();
-    // Deferred so the fetch never runs inside the build pass.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) widget.onFirstShown();
-    });
-  }
+class _Albums extends StatelessWidget {
+  const _Albums();
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
-
     return SignalBuilder(
       builder: (context) {
-        final albums = likedAlbumsSignal.value;
-
+        final albums = likedAlbumsSignal();
         if (albums.isEmpty) {
-          return Center(
-            child: Text(
-              'Нет любимых альбомов',
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurface.withValues(
-                  alpha: 0.38,
-                ),
-              ),
+          return const SliverToBoxAdapter(
+            child: GEmptyState(
+              icon: LucideIcons.disc3,
+              title: 'Нет альбомов',
+              message: 'Добавляйте альбомы в коллекцию со страницы альбома.',
             ),
           );
         }
-
-        return GridView.builder(
-          padding: EdgeInsets.fromLTRB(
-            isNarrow ? 12 : 32,
-            isNarrow ? 12 : 24,
-            isNarrow ? 12 : 32,
-            140,
+        return SliverToBoxAdapter(
+          child: MediaGrid(
+            children: [
+              for (final a in albums)
+                MediaTile(
+                  title: a.title,
+                  subtitle: [artistNames(a.artists), if (a.year != null) '${a.year}'].where((s) => s.isNotEmpty).join(' · '),
+                  coverUrl: a.coverUrl,
+                  icon: LucideIcons.disc3,
+                  onTap: () => navigateTo(AppSection.album, a.id),
+                  menu: () => [
+                    GMenuItem(
+                      label: 'Слушать',
+                      icon: LucideIcons.play,
+                      onSelected: () {
+                        final id = int.tryParse(a.id);
+                        if (id != null) unawaited(PlaybackController.playAlbum(id));
+                      },
+                    ),
+                    GMenuItem(
+                      label: 'Убрать из коллекции',
+                      icon: LucideIcons.heartOff,
+                      onSelected: () async {
+                        if (await removeLikedAlbumAction(a.id)) unawaited(refreshLikedAlbums());
+                      },
+                    ),
+                  ],
+                ),
+            ],
           ),
-          gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-            maxCrossAxisExtent: isNarrow ? 160 : 200,
-            mainAxisSpacing: 16,
-            crossAxisSpacing: 16,
-            childAspectRatio: 0.75,
-          ),
-          itemCount: albums.length,
-          itemBuilder: (context, index) {
-            final album = albums[index];
-            return CommonMediaCard(
-              title: album.title,
-              artists: album.artists,
-              coverUrl: album.coverUrl,
-              onTap: () => navigateTo(AppSection.album, album.id),
-            );
-          },
         );
       },
     );
   }
 }
 
-class _LikedArtistsTab extends StatefulWidget {
-  /// Fired once, on the first build after the tab becomes visible.
-  final VoidCallback onFirstShown;
-
-  const _LikedArtistsTab({required this.onFirstShown});
-
-  @override
-  State<_LikedArtistsTab> createState() => _LikedArtistsTabState();
-}
-
-class _LikedArtistsTabState extends State<_LikedArtistsTab> {
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) widget.onFirstShown();
-    });
-  }
-
-  static Future<void> _removeLikedArtist(
-    BuildContext context,
-    String artistId,
-  ) async {
-    final success = await removeLikedArtistAction(artistId);
-    if (!context.mounted) return;
-    if (success) {
-      likedArtistsSignal.value = likedArtistsSignal.value
-          .where((a) => a.id != artistId)
-          .toList();
-      showAppSuccess('Исполнитель удалён из любимых');
-    } else {
-      showAppError('Ошибка при обновлении любимых исполнителей');
-    }
-  }
+class _Artists extends StatelessWidget {
+  const _Artists();
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
-
     return SignalBuilder(
       builder: (context) {
-        final artists = likedArtistsSignal.value;
-
+        final artists = likedArtistsSignal();
         if (artists.isEmpty) {
-          return Center(
-            child: Text(
-              'Нет любимых исполнителей',
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurface.withValues(
-                  alpha: 0.38,
-                ),
-              ),
+          return const SliverToBoxAdapter(
+            child: GEmptyState(
+              icon: LucideIcons.user,
+              title: 'Нет исполнителей',
+              message: 'Отмечайте исполнителей сердечком на их странице.',
             ),
           );
         }
-
-        return GridView.builder(
-          padding: EdgeInsets.fromLTRB(
-            isNarrow ? 12 : 32,
-            isNarrow ? 12 : 24,
-            isNarrow ? 12 : 32,
-            140,
-          ),
-          gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-            maxCrossAxisExtent: isNarrow ? 160 : 200,
-            mainAxisSpacing: 16,
-            crossAxisSpacing: 16,
-            childAspectRatio: 0.75,
-          ),
-          itemCount: artists.length,
-          itemBuilder: (context, index) {
-            final artist = artists[index];
-            return Stack(
-              children: [
-                CommonMediaCard(
-                  title: artist.name,
-                  coverUrl: artist.coverUrl,
-                  isCircle: true,
-                  size: 140,
-                  onTap: () => navigateTo(AppSection.artist, artist.id),
-                ),
-                Positioned(
-                  top: 4,
-                  right: 4,
-                  child: IconButton(
-                    onPressed: () => unawaited(
-                      _removeLikedArtist(context, artist.id),
+        return SliverToBoxAdapter(
+          child: MediaGrid(
+            minTileWidth: 130,
+            maxColumns: 7,
+            children: [
+              for (final a in artists)
+                MediaTile(
+                  title: a.name,
+                  subtitle: 'Исполнитель',
+                  coverUrl: a.coverUrl,
+                  circle: true,
+                  icon: LucideIcons.user,
+                  onTap: () => navigateTo(AppSection.artist, a.id),
+                  menu: () => [
+                    GMenuItem(
+                      label: 'Моя волна по исполнителю',
+                      icon: LucideIcons.radio,
+                      onSelected: () => unawaited(PlaybackController.startArtistWave(a.id)),
                     ),
-                    tooltip: 'Убрать из любимых',
-                    icon: const Icon(Icons.favorite_rounded, size: 18),
-                    style: IconButton.styleFrom(
-                      minimumSize: const Size(36, 36),
-                      iconSize: 18,
-                      backgroundColor: Theme.of(
-                        context,
-                      ).colorScheme.surface.withValues(alpha: 0.85),
-                      foregroundColor: Theme.of(context).colorScheme.primary,
+                    GMenuItem(
+                      label: 'Убрать из любимых',
+                      icon: LucideIcons.heartOff,
+                      onSelected: () async {
+                        if (await removeLikedArtistAction(a.id)) {
+                          unawaited(refreshLikedArtists());
+                          showAppSuccess('Исполнитель удален из любимых');
+                        }
+                      },
                     ),
-                  ),
+                  ],
                 ),
-              ],
-            );
-          },
+            ],
+          ),
         );
       },
-    );
-  }
-}
-
-class _PlaylistCard extends StatefulWidget {
-  final SimplePlaylistDto playlist;
-  const _PlaylistCard({required this.playlist});
-
-  @override
-  State<_PlaylistCard> createState() => _PlaylistCardState();
-}
-
-class _PlaylistCardState extends State<_PlaylistCard> {
-  final ValueNotifier<bool> _isHovered = ValueNotifier(false);
-
-  @override
-  void dispose() {
-    _isHovered.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final playlist = widget.playlist;
-
-    return MouseRegion(
-      onEnter: (_) => _isHovered.value = true,
-      onExit: (_) => _isHovered.value = false,
-      child: ValueListenableBuilder<bool>(
-        valueListenable: _isHovered,
-        builder: (context, hovered, _) {
-          return GestureDetector(
-            onTap: () => navigateTo(
-              AppSection.playlist,
-              '${playlist.uid}:${playlist.kind}',
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                AspectRatio(
-                  aspectRatio: 1,
-                  child: Stack(
-                    children: [
-                      Container(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(AppRadius.md),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.4),
-                              blurRadius: 12,
-                              offset: const Offset(0, 6),
-                            ),
-                          ],
-                        ),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(AppRadius.md),
-                          child: TrackCover(
-                            url: playlist.coverUrl,
-                            size: 200,
-                            borderRadius: AppRadius.md,
-                          ),
-                        ),
-                      ),
-                      if (hovered)
-                        Positioned.fill(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              color: Colors.black45,
-                              borderRadius: BorderRadius.circular(AppRadius.md),
-                            ),
-                            child: Center(
-                              child: IconButton(
-                                iconSize: 48,
-                                icon: Icon(
-                                  Icons.play_circle_filled_rounded,
-                                  color: Theme.of(context).colorScheme.primary,
-                                ),
-                                onPressed: () => unawaited(
-                                  PlaybackController.playPlaylist(
-                                    playlist.uid.toString(),
-                                    playlist.kind,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  playlist.title,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurface,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  '${playlist.trackCount} треков',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurface.withValues(
-                      alpha: 0.38,
-                    ),
-                    fontSize: 13,
-                  ),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
     );
   }
 }

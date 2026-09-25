@@ -177,49 +177,59 @@ pub async fn init(_ctx: AppContext, _shutdown_rx: tokio::sync::watch::Receiver<b
 
 #[cfg(not(target_os = "android"))]
 pub async fn init(ctx: AppContext, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
-    let (tx, rx) = mpsc::channel::<ManagerCmd>();
+    // The manager and event threads live for the whole process; each session
+    // (one per signed-in account) only attaches its context. Spawning them per
+    // session would register every hotkey twice and dispatch each press twice.
+    let first_session = MANAGER_TX.get().is_none();
+    let manager_rx = if first_session {
+        let (tx, rx) = mpsc::channel::<ManagerCmd>();
+        if MANAGER_TX.set(tx).is_ok() {
+            let _ = RUNTIME.set(tokio::runtime::Handle::current());
+            Some(rx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    // Idempotent: the `OnceLock::set` results used to be discarded, so a second
-    // `init` kept the OLD sender (dropping the new one, so the new manager
-    // thread saw a disconnected channel and exited immediately) while spawning
-    // a SECOND event thread reading the same global receiver — every key press
-    // was then dispatched twice. Refuse to re-initialise instead.
-    if MANAGER_TX.set(tx).is_err() {
-        tracing::warn!("global hotkeys already initialised, ignoring re-init");
-        return;
-    }
-
-    let _ = RUNTIME.set(tokio::runtime::Handle::current());
     *CTX.write() = Some(ctx.clone());
 
     let settings = load_settings(&ctx).await;
     *SETTINGS.write() = merge_with_defaults(settings);
 
-    std::thread::Builder::new()
-        .name("hotkey-manager".into())
-        .spawn(move || manager_loop(rx))
-        .expect("spawn hotkey manager thread");
+    if let Some(rx) = manager_rx {
+        std::thread::Builder::new()
+            .name("hotkey-manager".into())
+            .spawn(move || manager_loop(rx))
+            .expect("spawn hotkey manager thread");
 
-    std::thread::Builder::new()
-        .name("hotkey-events".into())
-        .spawn(event_loop)
-        .expect("spawn hotkey event thread");
+        std::thread::Builder::new()
+            .name("hotkey-events".into())
+            .spawn(event_loop)
+            .expect("spawn hotkey event thread");
+    }
 
     apply_current();
 
+    // Detach this session when it ends so presses are ignored until the next
+    // session attaches (instead of reaching a stopped audio actor).
     tokio::spawn(async move {
-        let _ = shutdown_rx.changed().await;
-        if *shutdown_rx.borrow() {
-            if let Some(tx) = MANAGER_TX.get() {
-                let _ = tx.send(ManagerCmd::Shutdown);
+        while shutdown_rx.changed().await.is_ok() {
+            if *shutdown_rx.borrow() {
+                break;
             }
+        }
+        let mut current = CTX.write();
+        if current.as_ref().is_some_and(|c| c.same_session(&ctx)) {
+            *current = None;
         }
     });
 }
 
 #[cfg(not(target_os = "android"))]
 async fn load_settings(ctx: &AppContext) -> HotkeySettings {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     db.load_setting::<HotkeySettings>(SETTINGS_KEY)
         .await
         .ok()
@@ -228,7 +238,7 @@ async fn load_settings(ctx: &AppContext) -> HotkeySettings {
 }
 
 async fn persist_settings(ctx: &AppContext, settings: &HotkeySettings) {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     if let Err(e) = db.save_setting(SETTINGS_KEY, settings).await {
         tracing::error!("Failed to persist hotkey settings: {:?}", e);
     }

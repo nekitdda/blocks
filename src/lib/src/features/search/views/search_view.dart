@@ -1,18 +1,18 @@
-import 'package:m3e_core/m3e_core.dart';
+import 'dart:async';
+
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
-import 'package:youmuz/src/features/core/views/widgets/horizontal_shelf.dart';
-import 'package:youmuz/src/features/core/views/widgets/media_card.dart';
-import 'package:youmuz/src/features/core/views/widgets/responsive.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_elements.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_tile.dart';
-import 'package:youmuz/src/features/library/views/add_to_playlist_dialog.dart';
+import 'package:youmuz/src/features/core/views/widgets/media_tile.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_actions.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_row.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
 import 'package:youmuz/src/features/search/providers/search_provider.dart';
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
+/// Search results. On wide screens the query comes from the header field;
+/// otherwise the page has its own field.
 class SearchView extends StatefulWidget {
   const SearchView({super.key});
 
@@ -21,13 +21,8 @@ class SearchView extends StatefulWidget {
 }
 
 class _SearchViewState extends State<SearchView> {
-  final TextEditingController _controller = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    _controller.text = searchQuerySignal.value;
-  }
+  final _controller = TextEditingController(text: searchQuerySignal.value);
+  bool _allTracks = false;
 
   @override
   void dispose() {
@@ -37,265 +32,144 @@ class _SearchViewState extends State<SearchView> {
 
   @override
   Widget build(BuildContext context) {
+    final width = MediaQuery.sizeOf(context).width;
+    final inlineField = width < GLayout.wideBreakpoint;
     return SignalBuilder(
       builder: (context) {
-        final searchResultsAsync = searchResultsSignal.value;
-        final screenWidth = MediaQuery.sizeOf(context).width;
-        final isNarrow = screenWidth < 600;
+        final query = searchQuerySignal();
+        final async = searchResultsSignal();
+        final results = async.value;
 
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: isNarrow
-                  ? const EdgeInsets.fromLTRB(20, 16, 20, 8)
-                  : context.viewPadding,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Поиск',
-                    style:
-                        Theme.of(
-                          context,
-                        ).textTheme.displayMedium?.copyWith(
-                          fontSize: isNarrow ? 24 : 48,
-                          fontWeight: FontWeight.w900,
-                          color: Theme.of(context).colorScheme.onSurface,
-                          letterSpacing: -1.5,
-                          height: 1.05,
-                        ),
-                  ),
-                  if (!isNarrow) const SizedBox(height: 24),
-                  if (isNarrow) const SizedBox(height: 8),
-                  TextField(
-                    controller: _controller,
-                    onChanged: setSearchQuery,
-                    style: TextStyle(
-                      fontSize: isNarrow ? 18 : 24,
-                      color: Theme.of(context).colorScheme.onSurface,
-                    ),
-                    decoration: InputDecoration(
-                      hintText: 'Треки, альбомы, артисты...',
-                      hintStyle: TextStyle(
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
-                      ),
-                      prefixIcon: Padding(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: isNarrow ? 12 : 16,
-                        ),
-                        child: Icon(
-                          Icons.search,
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          size: isNarrow ? 24 : 32,
-                        ),
-                      ),
-                      filled: true,
-                      fillColor: Theme.of(
-                        context,
-                      ).colorScheme.onSurface.withValues(alpha: 0.05),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(isNarrow ? 16 : 24),
-                        borderSide: BorderSide.none,
-                      ),
-                      contentPadding: EdgeInsets.symmetric(
-                        vertical: isNarrow ? 16 : 24,
-                        horizontal: 20,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+        final children = <Widget>[
+          Text('Поиск', style: GText.headline(width >= 768 ? 36 : 30)),
+          const SizedBox(height: 20),
+          if (inlineField) ...[
+            GSearchField(
+              controller: _controller,
+              autofocus: query.isEmpty,
+              height: 44,
+              onChanged: setSearchQuery,
+              onSubmitted: setSearchQuery,
             ),
-            Expanded(
-              child: searchResultsAsync.map(
-                data: (results) {
-                  if (results == null) return const _EmptySearchState();
-                  if (results.tracks.isEmpty &&
-                      results.albums.isEmpty &&
-                      results.artists.isEmpty) {
-                    return Center(
-                      child: Text(
-                        'Ничего не найдено',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          fontSize: 18,
-                        ),
-                      ),
-                    );
-                  }
-                  return _SearchResults(results: results);
-                },
-                loading: () => const CommonLoadingWidget(),
-                error: (Object e, StackTrace? _) =>
-                    CommonErrorWidget(error: e.toString()),
-              ),
-            ),
+            const SizedBox(height: 24),
           ],
-        );
-      },
-    );
-  }
-}
+        ];
 
-class _EmptySearchState extends StatelessWidget {
-  const _EmptySearchState();
-
-  @override
-  Widget build(BuildContext context) {
-    final onSurface = Theme.of(context).colorScheme.onSurface;
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.manage_search_rounded,
-            size: 80,
-            color: onSurface.withValues(alpha: 0.1),
-          ),
-          const SizedBox(height: 16),
-          Text(
-            'Начните вводить текст',
-            style: TextStyle(
-              color: onSurface.withValues(alpha: 0.38),
-              fontSize: 18,
+        if (query.trim().isEmpty) {
+          children.add(
+            const GEmptyState(
+              icon: LucideIcons.search,
+              title: 'Что будем слушать?',
+              message: 'Ищите треки, альбомы, исполнителей и плейлисты.',
             ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _SearchResults extends StatelessWidget {
-  final SearchResultsDto results;
-
-  const _SearchResults({required this.results});
-
-  @override
-  Widget build(BuildContext context) {
-    return CustomScrollView(
-      slivers: [
-        if (results.artists.isNotEmpty) ...[
-          const SliverToBoxAdapter(child: CommonSectionTitle(title: 'Артисты')),
-          SliverToBoxAdapter(
-            child: HorizontalShelf(
-              height: 180,
-              padding: const EdgeInsets.symmetric(
-                horizontal: 32,
-              ), // 32 + 8 (internal card padding) = 40
-              itemCount: results.artists.length,
-              itemBuilder: (context, i) =>
-                  _ArtistSearchCard(artist: results.artists[i]),
+          );
+        } else if (async.isLoading && results == null) {
+          children.add(const GLoader());
+        } else if (async.hasError) {
+          children.add(
+            GEmptyState(
+              icon: LucideIcons.circleAlert,
+              title: 'Не удалось выполнить поиск',
+              message: '${async.error}',
+              action: GButton(
+                label: 'Повторить',
+                variant: GButtonVariant.secondary,
+                onPressed: () => unawaited(searchResultsSignal.refresh()),
+              ),
             ),
-          ),
-        ],
-        if (results.albums.isNotEmpty) ...[
-          const SliverToBoxAdapter(child: CommonSectionTitle(title: 'Альбомы')),
-          SliverToBoxAdapter(
-            child: HorizontalShelf(
-              height: 240,
-              padding: const EdgeInsets.symmetric(
-                horizontal: 32,
-              ), // 32 + 8 = 40
-              itemCount: results.albums.length,
-              itemBuilder: (context, i) =>
-                  _AlbumSearchCard(album: results.albums[i]),
+          );
+        } else if (results == null || _isEmpty(results)) {
+          children.add(
+            GEmptyState(
+              icon: LucideIcons.searchX,
+              title: 'Ничего не найдено',
+              message: 'По запросу «$query» ничего нет. Попробуйте иначе.',
             ),
-          ),
-        ],
-        if (results.tracks.isNotEmpty) ...[
-          const SliverToBoxAdapter(child: CommonSectionTitle(title: 'Треки')),
-          SliverM3ESegmentedList(
-            haptic: M3EHapticFeedback.light,
-            itemCount: results.tracks.length,
-            color: Colors.transparent,
-            padding: EdgeInsets.symmetric(
-              horizontal: context.isNarrow ? 0 : 32,
-              vertical: 4,
-            ),
-            itemBuilder: (context, i) =>
-                _TrackSearchTile(track: results.tracks[i]),
-          ),
-          const SliverToBoxAdapter(child: SizedBox(height: 40)),
-        ],
-        const SliverPadding(padding: EdgeInsets.only(bottom: 140)),
-      ],
-    );
-  }
-}
-
-class _TrackSearchTile extends StatelessWidget {
-  final SimpleTrackDto track;
-
-  const _TrackSearchTile({required this.track});
-
-  @override
-  Widget build(BuildContext context) {
-    return CommonTrackTile(
-      trackId: track.id,
-      title: track.title,
-      version: track.version,
-      artists: track.artists,
-      albumId: track.albumId,
-      leading: TrackCover(url: track.coverUrl),
-      trailing: Text(
-        formatDuration(track.durationMs),
-        style: TextStyle(
-          color: Theme.of(context).colorScheme.onSurfaceVariant,
-        ),
-      ),
-      hoverActions: [
-        IconButton(
-          icon: Icon(
-            Icons.add_rounded,
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
-          tooltip: 'Добавить в плейлист',
-          onPressed: () => AddToPlaylistDialog.show(context, track),
-        ),
-      ],
-      onTap: () => PlaybackController.playTrack(track.id),
-      onTitleTap: () {
-        if (track.albumId != null) {
-          navigateTo(AppSection.album, track.albumId);
+          );
+        } else {
+          children.addAll(_results(results));
         }
+
+        return GScrollPage(children: children);
       },
     );
   }
-}
 
-class _AlbumSearchCard extends StatelessWidget {
-  final SimpleAlbumDto album;
+  bool _isEmpty(SearchResultsDto r) =>
+      r.tracks.isEmpty && r.albums.isEmpty && r.artists.isEmpty && r.playlists.isEmpty;
 
-  const _AlbumSearchCard({required this.album});
-
-  @override
-  Widget build(BuildContext context) {
-    return CommonMediaCard(
-      title: album.title,
-      artists: album.artists,
-      coverUrl: album.coverUrl,
-      onTap: () => navigateTo(AppSection.album, album.id),
-    );
-  }
-}
-
-class _ArtistSearchCard extends StatelessWidget {
-  final SimpleArtistDto artist;
-
-  const _ArtistSearchCard({required this.artist});
-
-  @override
-  Widget build(BuildContext context) {
-    return CommonMediaCard(
-      title: artist.name,
-      coverUrl: artist.coverUrl,
-      isCircle: true,
-      size: 140,
-      onTap: () => navigateTo(AppSection.artist, artist.id),
-    );
+  List<Widget> _results(SearchResultsDto r) {
+    final tracks = _allTracks ? r.tracks : r.tracks.take(6).toList();
+    return [
+      if (r.tracks.isNotEmpty) ...[
+        GSectionHeader(
+          'Треки',
+          bottom: 12,
+          trailing: r.tracks.length > 6
+              ? GTextAction(
+                  label: _allTracks ? 'Свернуть' : 'Все ${r.tracks.length}',
+                  onPressed: () => setState(() => _allTracks = !_allTracks),
+                )
+              : null,
+        ),
+        for (final t in tracks)
+          TrackRow(
+            key: ValueKey('search_${t.id}'),
+            track: t,
+            onPlay: () => unawaited(PlaybackController.playTrack(t.id)),
+          ),
+        const SizedBox(height: 40),
+      ],
+      if (r.artists.isNotEmpty) ...[
+        const GSectionHeader('Исполнители'),
+        MediaGrid(
+          minTileWidth: 130,
+          maxColumns: 7,
+          children: [
+            for (final a in r.artists.take(7))
+              MediaTile(
+                title: a.name,
+                subtitle: 'Исполнитель',
+                coverUrl: a.coverUrl,
+                circle: true,
+                icon: LucideIcons.user,
+                onTap: () => navigateTo(AppSection.artist, a.id),
+              ),
+          ],
+        ),
+        const SizedBox(height: 40),
+      ],
+      if (r.albums.isNotEmpty) ...[
+        const GSectionHeader('Альбомы'),
+        MediaGrid(
+          children: [
+            for (final a in r.albums.take(12))
+              MediaTile(
+                title: a.title,
+                subtitle: [artistNames(a.artists), if (a.year != null) '${a.year}'].where((s) => s.isNotEmpty).join(' · '),
+                coverUrl: a.coverUrl,
+                icon: LucideIcons.disc3,
+                onTap: () => navigateTo(AppSection.album, a.id),
+              ),
+          ],
+        ),
+        const SizedBox(height: 40),
+      ],
+      if (r.playlists.isNotEmpty) ...[
+        const GSectionHeader('Плейлисты'),
+        MediaGrid(
+          children: [
+            for (final p in r.playlists.take(12))
+              MediaTile(
+                title: p.title,
+                subtitle: '${p.trackCount} ${plural(p.trackCount, 'трек', 'трека', 'треков')}',
+                coverUrl: p.coverUrl,
+                icon: LucideIcons.listMusic,
+                onTap: () => navigateTo(AppSection.playlist, '${p.uid}:${p.kind}'),
+              ),
+          ],
+        ),
+      ],
+    ];
   }
 }

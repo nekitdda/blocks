@@ -1,168 +1,337 @@
 import 'dart:async';
+import 'dart:io';
 
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
+import 'package:youmuz/src/features/core/views/widgets/quality_selector.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
-class AudioSettingsDialog extends StatefulWidget {
+/// Output quality, equalizer and DSP effects in one panel: a bottom sheet on
+/// Android ([bottomSheet]), a dialog elsewhere. [show] picks the right one.
+class AudioSettingsDialog extends StatelessWidget {
   final bool bottomSheet;
 
   const AudioSettingsDialog({super.key, this.bottomSheet = false});
 
+  /// Refreshes the equalizer and effect state, then opens the panel.
+  static Future<void> show(BuildContext context) {
+    unawaited(refreshEqualizer());
+    unawaited(refreshAudioEffects());
+    if (Platform.isAndroid) {
+      return showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (_) => const AudioSettingsDialog(bottomSheet: true),
+      );
+    }
+    return showGDialog<void>(
+      context,
+      builder: (_) => const AudioSettingsDialog(),
+    );
+  }
+
+  static const _sections = <Widget>[
+    _QualitySection(),
+    _SectionDivider(),
+    _EqualizerSection(),
+    _SectionDivider(),
+    _EffectsSection(),
+  ];
+
   @override
-  State<AudioSettingsDialog> createState() => _AudioSettingsDialogState();
+  Widget build(BuildContext context) {
+    final sliderTheme = SliderTheme.of(
+      context,
+    ).copyWith(tickMarkShape: SliderTickMarkShape.noTickMark);
+
+    if (bottomSheet) {
+      return SliderTheme(
+        data: sliderTheme,
+        child: DraggableScrollableSheet(
+          initialChildSize: 0.7,
+          minChildSize: 0.4,
+          maxChildSize: 0.9,
+          snap: true,
+          expand: false,
+          builder: (context, scrollController) => ListView(
+            controller: scrollController,
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
+            children: [
+              Text('Настройки звука', style: GText.lg(weight: GText.semibold)),
+              const SizedBox(height: 20),
+              ..._sections,
+            ],
+          ),
+        ),
+      );
+    }
+
+    return SliderTheme(
+      data: sliderTheme,
+      child: GDialog(
+        title: 'Настройки звука',
+        width: 680,
+        content: const SingleChildScrollView(
+          // Keeps the desktop scrollbar clear of the switches.
+          padding: EdgeInsets.only(right: 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: _sections,
+          ),
+        ),
+        actions: [
+          GButton(
+            label: 'Закрыть',
+            variant: GButtonVariant.secondary,
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-class _AudioSettingsDialogState extends State<AudioSettingsDialog> {
-  int _activeTab = 0; // 0: EQ, 1: FX
+class _SectionDivider extends StatelessWidget {
+  const _SectionDivider();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 20),
+      child: GDivider(),
+    );
+  }
+}
+
+/// `text-sm font-medium` title with an optional status line and controls.
+class _SectionHeader extends StatelessWidget {
+  final String title;
+  final String? subtitle;
+
+  /// Shows [subtitle] in the brand colour (e.g. "Включён").
+  final bool subtitleActive;
+  final Widget? trailing;
+
+  const _SectionHeader({
+    required this.title,
+    this.subtitle,
+    this.subtitleActive = false,
+    this.trailing,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(title, style: GText.sm(weight: GText.medium)),
+              if (subtitle != null) ...[
+                const SizedBox(height: 2),
+                Text(
+                  subtitle!,
+                  style: GText.xs(
+                    color: subtitleActive
+                        ? GColors.brand
+                        : GColors.mutedForeground,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        ?trailing,
+      ],
+    );
+  }
+}
+
+class _QualitySection extends StatelessWidget {
+  const _QualitySection();
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final cs = Theme.of(context).colorScheme;
-        final tabs = [
-          const Tab(text: 'Эквалайзер'),
-          const Tab(text: 'Эффекты (DSP)'),
-        ];
-
-        if (widget.bottomSheet) {
-          return DraggableScrollableSheet(
-            initialChildSize: 0.7,
-            minChildSize: 0.4,
-            maxChildSize: 0.9,
-            snap: true,
-            expand: false,
-            builder: (context, scrollController) {
-              return DefaultTabController(
-                length: 2,
-                child: Column(
-                  children: [
-                    const SizedBox(height: 12),
-                    Container(
-                      width: 32,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: cs.onSurface.withValues(alpha: 0.24),
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      child: TabBar(
-                        onTap: (i) => setState(() => _activeTab = i),
-                        indicator: UnderlineTabIndicator(
-                          borderRadius: BorderRadius.circular(4),
-                          borderSide: BorderSide(
-                            width: 3,
-                            color: accentColorSignal.value,
-                          ),
-                        ),
-                        splashBorderRadius: BorderRadius.circular(12),
-                        labelColor: cs.onSurface,
-                        unselectedLabelColor: cs.onSurface.withValues(
-                          alpha: 0.38,
-                        ),
-                        tabs: tabs,
-                      ),
-                    ),
-                    const SizedBox(height: 1),
-                    Divider(
-                      height: 1,
-                      color: cs.onSurface.withValues(alpha: 0.1),
-                    ),
-                    const Expanded(
-                      child: Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 20),
-                        child: TabBarView(
-                          physics: NeverScrollableScrollPhysics(),
-                          children: [
-                            _EqualizerView(),
-                            _EffectsView(),
-                          ],
-                        ),
-                      ),
-                    ),
-                    if (_activeTab == 0)
-                      TextButton(
-                        onPressed: () =>
-                            unawaited(PlaybackController.resetEqualizer()),
-                        child: Text(
-                          'Сбросить',
-                          style: TextStyle(color: cs.error),
-                        ),
-                      ),
-                  ],
-                ),
-              );
-            },
-          );
-        }
-
-        return DefaultTabController(
-          length: 2,
-          child: AppDialog(
-            titlePadding: EdgeInsets.zero,
-            titleWidget: Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-                  child: Row(
-                    children: [
-                      Text(
-                        'Настройки звука',
-                        style: TextStyle(
-                          color: cs.onSurface,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                TabBar(
-                  onTap: (i) => setState(() => _activeTab = i),
-                  indicator: UnderlineTabIndicator(
-                    borderRadius: BorderRadius.circular(4),
-                    borderSide: BorderSide(
-                      width: 3,
-                      color: accentColorSignal.value,
-                    ),
-                  ),
-                  splashBorderRadius: BorderRadius.circular(12),
-                  labelColor: cs.onSurface,
-                  unselectedLabelColor: cs.onSurface.withValues(alpha: 0.38),
-                  tabs: tabs,
-                ),
-              ],
+        final codec = trackMetadataSignal.value.codec;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _SectionHeader(
+              title: 'Качество звука',
+              trailing: codec == null
+                  ? null
+                  : GBadge('Поток: ${codec.toUpperCase()}'),
             ),
-            content: const SizedBox(
-              width: 700,
-              height: 450,
-              child: TabBarView(
-                physics: NeverScrollableScrollPhysics(),
+            const SizedBox(height: 12),
+            const CommonQualitySelector.segmented(),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _EqualizerSection extends StatelessWidget {
+  const _EqualizerSection();
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final eq = equalizerSignal.value;
+        final enabled = eq?.enabled ?? false;
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _SectionHeader(
+              title: 'Эквалайзер',
+              subtitle: eq == null ? null : (enabled ? 'Включён' : 'Выключен'),
+              subtitleActive: enabled,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  _EqualizerView(),
-                  _EffectsView(),
+                  GButton(
+                    label: 'Сбросить',
+                    icon: LucideIcons.rotateCcw,
+                    variant: GButtonVariant.ghost,
+                    size: GButtonSize.sm,
+                    onPressed: eq == null
+                        ? null
+                        : () => unawaited(PlaybackController.resetEqualizer()),
+                  ),
+                  const SizedBox(width: 8),
+                  Switch(
+                    value: enabled,
+                    onChanged: eq == null
+                        ? null
+                        : (value) => unawaited(
+                            PlaybackController.setEqualizerEnabled(
+                              enabled: value,
+                            ),
+                          ),
+                  ),
                 ],
               ),
             ),
-            actions: [
-              if (_activeTab == 0)
-                TextButton(
-                  onPressed: () =>
-                      unawaited(PlaybackController.resetEqualizer()),
-                  child: Text(
-                    'Сбросить',
-                    style: TextStyle(color: cs.error),
-                  ),
+            const SizedBox(height: 16),
+            if (eq == null)
+              const GLoader(padding: 32)
+            else
+              AnimatedOpacity(
+                duration: GDurations.medium,
+                curve: GCurves.standard,
+                opacity: enabled ? 1 : 0.5,
+                child: _EqualizerBands(bands: eq.bands, enabled: enabled),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+const double _eqMinGain = -12;
+const double _eqMaxGain = 12;
+
+/// Height of the gain label above and the frequency label below each band.
+const double _eqLabelBlock = 20;
+
+/// Theme thumb radius: the slider track starts this far inside its box.
+const double _eqTrackInset = 6;
+
+/// Vertical offset of [gain] inside a band slider area of [height].
+double _gainY(double gain, double height) {
+  final t = (gain - _eqMinGain) / (_eqMaxGain - _eqMinGain);
+  return _eqTrackInset + (1 - t) * (height - 2 * _eqTrackInset);
+}
+
+String _formatGain(double gain) {
+  if (gain.abs() < 0.05) return '0.0';
+  return '${gain > 0 ? '+' : ''}${gain.toStringAsFixed(1)}';
+}
+
+String _formatFreq(double freq) {
+  if (freq >= 1000) {
+    return '${(freq / 1000).toStringAsFixed(freq % 1000 == 0 ? 0 : 1)}к';
+  }
+  return '${freq.toInt()}';
+}
+
+Widget _bandSlider(BandDto band, double gain, {required bool enabled}) {
+  return Slider(
+    value: gain,
+    min: _eqMinGain,
+    max: _eqMaxGain,
+    semanticFormatterCallback: (value) =>
+        '${band.frequency.round()} Гц: ${_formatGain(value)} дБ',
+    onChanged: enabled
+        ? (value) =>
+              unawaited(PlaybackController.setEqualizerBand(band.index, value))
+        : null,
+  );
+}
+
+class _EqualizerBands extends StatelessWidget {
+  final List<BandDto> bands;
+  final bool enabled;
+
+  const _EqualizerBands({required this.bands, required this.enabled});
+
+  static const double _rulerWidth = 28;
+  static const double _minBandWidth = 34;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final fitsColumns =
+            constraints.maxWidth >=
+            _rulerWidth + 8 + _minBandWidth * bands.length;
+
+        if (!fitsColumns) {
+          // Narrow (touch) layouts get one horizontal slider per band, which
+          // also keeps band drags from fighting the sheet's vertical scroll.
+          return Column(
+            children: [
+              for (final band in bands) _BandRow(band: band, enabled: enabled),
+            ],
+          );
+        }
+
+        return SizedBox(
+          height: 208,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(width: _rulerWidth, child: _GainRuler()),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Stack(
+                  children: [
+                    const Positioned.fill(
+                      child: _BandBlocks(
+                        child: CustomPaint(painter: _GainGridPainter()),
+                      ),
+                    ),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (final band in bands)
+                          Expanded(
+                            child: _BandColumn(band: band, enabled: enabled),
+                          ),
+                      ],
+                    ),
+                  ],
                 ),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Закрыть'),
               ),
             ],
           ),
@@ -172,442 +341,274 @@ class _AudioSettingsDialogState extends State<AudioSettingsDialog> {
   }
 }
 
-class _EqualizerView extends StatelessWidget {
-  const _EqualizerView();
+/// Reserves the label rows above and below, so the ruler, grid and band
+/// sliders share one vertical scale.
+class _BandBlocks extends StatelessWidget {
+  final Widget child;
 
-  // Height reserved above each slider for the gain value, and below for the
-  // frequency label. Kept in sync across the ruler, grid and bands so they
-  // stay aligned regardless of screen size.
-  static const double _gainBlockHeight = 24;
-  static const double _freqBlockHeight = 22;
+  const _BandBlocks({required this.child});
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final cs = Theme.of(context).colorScheme;
-        final eq = equalizerSignal.value;
-        if (eq == null) {
-          return const Center(child: M3ELoadingIndicator());
-        }
-
-        final accent = accentColorSignal.value;
-        final enabled = eq.enabled;
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _buildHeader(context, accent, enabled),
-            Expanded(
-              child: AnimatedOpacity(
-                opacity: enabled ? 1 : 0.45,
-                duration: const Duration(milliseconds: 200),
-                child: Container(
-                  padding: const EdgeInsets.fromLTRB(10, 18, 12, 8),
-                  decoration: BoxDecoration(
-                    color: cs.onSurface.withValues(alpha: 0.03),
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(
-                      color: cs.onSurface.withValues(alpha: 0.05),
-                    ),
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildGainRuler(context),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: LayoutBuilder(
-                          builder: (context, constraints) {
-                            const minBandWidth = 38.0;
-                            final bandCount = eq.bands.length;
-                            final needsScroll =
-                                constraints.maxWidth < minBandWidth * bandCount;
-
-                            final bandsRow = Row(
-                              children: eq.bands.map((band) {
-                                final child = _buildBand(
-                                  context,
-                                  band,
-                                  accent,
-                                  enabled,
-                                );
-                                return needsScroll
-                                    ? SizedBox(
-                                        width: minBandWidth,
-                                        child: child,
-                                      )
-                                    : Expanded(child: child);
-                              }).toList(),
-                            );
-
-                            final content = Stack(
-                              children: [
-                                Positioned.fill(
-                                  child: _buildGrid(context, accent),
-                                ),
-                                bandsRow,
-                              ],
-                            );
-
-                            if (!needsScroll) return content;
-
-                            return SingleChildScrollView(
-                              scrollDirection: Axis.horizontal,
-                              child: SizedBox(
-                                width: minBandWidth * bandCount,
-                                height: constraints.maxHeight,
-                                child: content,
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Widget _buildHeader(
-    BuildContext context,
-    Color accent,
-    bool enabled,
-  ) {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 16),
-      padding: const EdgeInsets.fromLTRB(16, 8, 10, 8),
-      decoration: BoxDecoration(
-        color: cs.onSurface.withValues(alpha: 0.04),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: cs.onSurface.withValues(alpha: 0.06)),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            Icons.graphic_eq_rounded,
-            size: 22,
-            color: enabled ? accent : cs.onSurface.withValues(alpha: 0.3),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Эквалайзер',
-                  style: TextStyle(
-                    color: cs.onSurface,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 15,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  enabled ? 'Активен' : 'Выключен',
-                  style: TextStyle(
-                    color: enabled
-                        ? accent
-                        : cs.onSurface.withValues(alpha: 0.38),
-                    fontSize: 11,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Switch(
-            value: enabled,
-            onChanged: (val) => unawaited(
-              PlaybackController.setEqualizerEnabled(enabled: val),
-            ),
-            activeThumbColor: accent,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildGainRuler(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    const labels = ['+12', '+6', '0', '-6', '-12'];
-    return SizedBox(
-      width: 30,
-      child: Column(
-        children: [
-          const SizedBox(height: _gainBlockHeight),
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: labels
-                  .map(
-                    (t) => Text(
-                      t,
-                      style: TextStyle(
-                        fontSize: 9,
-                        color: cs.onSurface.withValues(alpha: 0.3),
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      ),
-                    ),
-                  )
-                  .toList(),
-            ),
-          ),
-          const SizedBox(height: _freqBlockHeight),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildGrid(BuildContext context, Color accent) {
-    final cs = Theme.of(context).colorScheme;
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const SizedBox(height: _gainBlockHeight),
-        Expanded(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: List.generate(5, (i) {
-              final isZero = i == 2;
-              return Container(
-                height: 1,
-                color: isZero
-                    ? accent.withValues(alpha: 0.28)
-                    : cs.onSurface.withValues(alpha: 0.05),
-              );
-            }),
-          ),
-        ),
-        const SizedBox(height: _freqBlockHeight),
+        const SizedBox(height: _eqLabelBlock),
+        Expanded(child: child),
+        const SizedBox(height: _eqLabelBlock),
       ],
     );
-  }
-
-  Widget _buildBand(
-    BuildContext context,
-    BandDto band,
-    Color accent,
-    bool enabled,
-  ) {
-    final cs = Theme.of(context).colorScheme;
-    final gain = band.gainDb.clamp(-12.0, 12.0);
-    final isNeutral = gain.abs() < 0.05;
-
-    return Column(
-      children: [
-        SizedBox(
-          height: _gainBlockHeight,
-          child: FittedBox(
-            fit: BoxFit.scaleDown,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: isNeutral
-                    ? Theme.of(
-                        context,
-                      ).colorScheme.onSurface.withValues(alpha: 0.05)
-                    : accent.withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                '${gain > 0 ? '+' : ''}${gain.toStringAsFixed(1)}',
-                style: TextStyle(
-                  fontSize: 9,
-                  color: isNeutral
-                      ? Theme.of(
-                          context,
-                        ).colorScheme.onSurfaceVariant.withValues(alpha: 0.7)
-                      : accent,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                ),
-              ),
-            ),
-          ),
-        ),
-        Expanded(
-          child: M3ESlider(
-            orientation: Axis.vertical,
-            value: gain,
-            min: -12,
-            max: 12,
-            enabled: enabled,
-            decoration: M3ESliderDecoration(
-              colors: M3ESliderColors(
-                thumbColor: enabled
-                    ? accent
-                    : cs.onSurface.withValues(alpha: 0.38),
-                disabledThumbColor: cs.onSurface.withValues(alpha: 0.38),
-                activeTrackColor: accent.withValues(alpha: enabled ? 0.7 : 0.3),
-                inactiveTrackColor: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.12),
-                disabledActiveTrackColor: accent.withValues(alpha: 0.3),
-                disabledInactiveTrackColor: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.12),
-                activeTickColor: accent.withValues(alpha: 0.7),
-                inactiveTickColor: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.12),
-                disabledActiveTickColor: cs.onSurface.withValues(alpha: 0.38),
-                disabledInactiveTickColor: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.12),
-              ),
-              trackHeight: 4,
-              thumbWidth: 8,
-              thumbHeight: 14,
-            ),
-            onChanged: enabled
-                ? (val) => unawaited(
-                    PlaybackController.setEqualizerBand(band.index, val),
-                  )
-                : null,
-          ),
-        ),
-        SizedBox(
-          height: _freqBlockHeight,
-          child: FittedBox(
-            fit: BoxFit.scaleDown,
-            child: Text(
-              _formatFreq(band.frequency),
-              style: TextStyle(
-                fontSize: 10,
-                color: cs.onSurface.withValues(alpha: 0.54),
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  String _formatFreq(double freq) {
-    if (freq >= 1000) {
-      return '${(freq / 1000).toStringAsFixed(freq % 1000 == 0 ? 0 : 1)}к';
-    }
-    return '${freq.toInt()}';
   }
 }
 
-class _EffectsView extends StatelessWidget {
-  const _EffectsView();
+class _GainRuler extends StatelessWidget {
+  const _GainRuler();
+
+  static const List<({double gain, String label})> _marks = [
+    (gain: 12.0, label: '+12'),
+    (gain: 6.0, label: '+6'),
+    (gain: 0.0, label: '0'),
+    (gain: -6.0, label: '-6'),
+    (gain: -12.0, label: '-12'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final style = GText.time(size: 10);
+    final halfLine = (style.fontSize! * style.height!) / 2;
+    return _BandBlocks(
+      child: LayoutBuilder(
+        builder: (context, constraints) => Stack(
+          clipBehavior: Clip.none,
+          children: [
+            for (final mark in _marks)
+              Positioned(
+                right: 0,
+                top: _gainY(mark.gain, constraints.maxHeight) - halfLine,
+                child: Text(mark.label, style: style),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Hairlines at ±12, ±6 and 0 dB; the 0 dB line is a step brighter.
+class _GainGridPainter extends CustomPainter {
+  const _GainGridPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final line = Paint()
+      ..color = GColors.border
+      ..strokeWidth = 1;
+    final zero = Paint()
+      ..color = GColors.foreground20
+      ..strokeWidth = 1;
+    for (final gain in const [12.0, 6.0, 0.0, -6.0, -12.0]) {
+      final y = _gainY(gain, size.height).roundToDouble() + 0.5;
+      canvas.drawLine(
+        Offset(0, y),
+        Offset(size.width, y),
+        gain == 0 ? zero : line,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_GainGridPainter oldDelegate) => false;
+}
+
+/// Vertical band: gain above, slider, frequency below.
+class _BandColumn extends StatelessWidget {
+  final BandDto band;
+  final bool enabled;
+
+  const _BandColumn({required this.band, required this.enabled});
+
+  @override
+  Widget build(BuildContext context) {
+    final gain = band.gainDb.clamp(_eqMinGain, _eqMaxGain);
+    final boosted = enabled && gain.abs() >= 0.05;
+
+    return Column(
+      children: [
+        SizedBox(
+          height: _eqLabelBlock,
+          child: Center(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                _formatGain(gain),
+                style: GText.time(
+                  size: 10,
+                  color: boosted ? GColors.brand : GColors.mutedForeground,
+                ),
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          // Quarter turns 3: the slider's minimum ends up at the bottom.
+          child: RotatedBox(
+            quarterTurns: 3,
+            child: _bandSlider(band, gain, enabled: enabled),
+          ),
+        ),
+        SizedBox(
+          height: _eqLabelBlock,
+          child: Center(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                _formatFreq(band.frequency),
+                style: GText.time(size: 10),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Horizontal band for narrow layouts: frequency, slider, gain.
+class _BandRow extends StatelessWidget {
+  final BandDto band;
+  final bool enabled;
+
+  const _BandRow({required this.band, required this.enabled});
+
+  @override
+  Widget build(BuildContext context) {
+    final gain = band.gainDb.clamp(_eqMinGain, _eqMaxGain);
+    final boosted = enabled && gain.abs() >= 0.05;
+
+    return SizedBox(
+      height: 36,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 40,
+            child: Text(_formatFreq(band.frequency), style: GText.time()),
+          ),
+          Expanded(child: _bandSlider(band, gain, enabled: enabled)),
+          SizedBox(
+            width: 44,
+            child: Text(
+              _formatGain(gain),
+              textAlign: TextAlign.right,
+              style: GText.time(
+                color: boosted ? GColors.brand : GColors.mutedForeground,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EffectsSection extends StatelessWidget {
+  const _EffectsSection();
 
   // Matches the effect ids registered in src/rust/src/audio/fx/init.rs.
   static const _icons = <String, IconData>{
-    'chorus': Icons.waves_rounded, // layered, wavering pitch
-    'lowpass': Icons.arrow_downward_rounded, // lets lows through
-    'highpass': Icons.arrow_upward_rounded, // lets highs through
-    'bandpass': Icons.swap_horiz_rounded, // passes a band, cuts both sides
-    'notch': Icons.remove_rounded, // cuts a thin band out
-    'dc_block': Icons.horizontal_rule_rounded, // flattens the DC offset
-    'reverb': Icons.blur_on_rounded, // diffuse, spatial reflections
-    'delay': Icons.repeat_rounded, // repeating echoes
-    'compressor': Icons.compress_rounded, // squeezes dynamic range
-    'overdrive': Icons.bolt_rounded, // driven/distorted signal
+    'chorus': LucideIcons.waves, // layered, wavering pitch
+    'lowpass': LucideIcons.arrowDownToLine, // lets lows through
+    'highpass': LucideIcons.arrowUpToLine, // lets highs through
+    'bandpass': LucideIcons.arrowLeftRight, // passes a band, cuts both sides
+    'notch': LucideIcons.minus, // cuts a thin band out
+    'dc_block': LucideIcons.foldVertical, // flattens the DC offset
+    'reverb': LucideIcons.radar, // diffuse, spatial reflections
+    'delay': LucideIcons.repeat, // repeating echoes
+    'compressor': LucideIcons.shrink, // squeezes dynamic range
+    'overdrive': LucideIcons.zap, // driven/distorted signal
   };
-
-  IconData _iconFor(String id) => _icons[id] ?? Icons.tune_rounded;
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
         final effects = audioEffectsSignal.value;
-        if (effects.isEmpty) {
-          return const Center(child: M3ELoadingIndicator());
-        }
-
-        final accent = accentColorSignal.value;
-
-        return ListView.separated(
-          itemCount: effects.length,
-          padding: const EdgeInsets.symmetric(vertical: 16),
-          separatorBuilder: (context, index) => const SizedBox(height: 10),
-          itemBuilder: (context, index) {
-            final effect = effects[index];
-            return _EffectCard(
-              effect: effect,
-              accent: accent,
-              icon: _iconFor(effect.id),
-            );
-          },
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const _SectionHeader(
+              title: 'Эффекты',
+              subtitle: 'Обработка сигнала (DSP)',
+            ),
+            const SizedBox(height: 8),
+            if (effects.isEmpty)
+              const GLoader(padding: 32)
+            else
+              for (final effect in effects)
+                _EffectTile(
+                  key: ValueKey(effect.id),
+                  effect: effect,
+                  icon: _icons[effect.id] ?? LucideIcons.slidersHorizontal,
+                ),
+          ],
         );
       },
     );
   }
 }
 
-class _EffectCard extends StatefulWidget {
+/// Effect row (`rounded-xl`, hover `bg-secondary`); tapping it unfolds the
+/// parameters on a `bg-secondary` panel.
+class _EffectTile extends StatefulWidget {
   final AudioEffectDto effect;
-  final Color accent;
   final IconData icon;
 
-  const _EffectCard({
-    required this.effect,
-    required this.accent,
-    required this.icon,
-  });
+  const _EffectTile({required this.effect, required this.icon, super.key});
 
   @override
-  State<_EffectCard> createState() => _EffectCardState();
+  State<_EffectTile> createState() => _EffectTileState();
 }
 
-class _EffectCardState extends State<_EffectCard> {
+class _EffectTileState extends State<_EffectTile> {
   bool _expanded = false;
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     final effect = widget.effect;
-    final accent = widget.accent;
     final enabled = effect.enabled;
 
     return AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOut,
+      duration: GDurations.fast,
+      curve: GCurves.standard,
+      margin: const EdgeInsets.only(bottom: 4),
       decoration: BoxDecoration(
-        color: cs.onSurface.withValues(alpha: _expanded ? 0.05 : 0.03),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: enabled
-              ? accent.withValues(alpha: 0.25)
-              : cs.onSurface.withValues(alpha: 0.06),
-        ),
+        color: _expanded ? GColors.secondary : const Color(0x00000000),
+        borderRadius: BorderRadius.circular(GRadius.xl),
       ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(14),
+          GPressable(
             onTap: () => setState(() => _expanded = !_expanded),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+            semanticLabel: effect.name,
+            builder: (context, s) => AnimatedContainer(
+              duration: GDurations.fast,
+              curve: GCurves.standard,
+              padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+              decoration: BoxDecoration(
+                color: !_expanded && s.hovered
+                    ? GColors.secondary
+                    : const Color(0x00000000),
+                borderRadius: BorderRadius.circular(GRadius.xl),
+                border: Border.all(
+                  color: s.focused ? GColors.ring : const Color(0x00000000),
+                ),
+              ),
               child: Row(
                 children: [
-                  Container(
-                    width: 34,
-                    height: 34,
-                    decoration: BoxDecoration(
-                      color: enabled
-                          ? accent.withValues(alpha: 0.16)
-                          : cs.onSurface.withValues(alpha: 0.05),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Icon(
-                      widget.icon,
-                      size: 18,
-                      color: enabled
-                          ? accent
-                          : cs.onSurface.withValues(alpha: 0.3),
-                    ),
+                  Icon(
+                    widget.icon,
+                    size: 16,
+                    color: enabled ? GColors.brand : GColors.mutedForeground,
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -616,20 +617,16 @@ class _EffectCardState extends State<_EffectCard> {
                       children: [
                         Text(
                           effect.name,
-                          style: TextStyle(
-                            color: cs.onSurface,
-                            fontWeight: FontWeight.w600,
-                            fontSize: 13,
-                          ),
+                          style: GText.sm(weight: GText.medium),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        const SizedBox(height: 2),
                         Text(
                           enabled ? 'Включён' : 'Выключен',
-                          style: TextStyle(
+                          style: GText.xs(
                             color: enabled
-                                ? accent
-                                : cs.onSurface.withValues(alpha: 0.38),
-                            fontSize: 11,
+                                ? GColors.brand
+                                : GColors.mutedForeground,
                           ),
                         ),
                       ],
@@ -637,74 +634,71 @@ class _EffectCardState extends State<_EffectCard> {
                   ),
                   Switch(
                     value: enabled,
-                    onChanged: (val) => unawaited(
+                    onChanged: (value) => unawaited(
                       PlaybackController.setEffectEnabled(
                         effect.id,
-                        enabled: val,
+                        enabled: value,
                       ),
                     ),
-                    activeThumbColor: accent,
                   ),
+                  const SizedBox(width: 4),
                   AnimatedRotation(
-                    duration: const Duration(milliseconds: 180),
+                    duration: GDurations.medium,
+                    curve: GCurves.standard,
                     turns: _expanded ? 0.5 : 0,
                     child: Icon(
-                      Icons.expand_more_rounded,
-                      color: cs.onSurface.withValues(alpha: 0.38),
+                      LucideIcons.chevronDown,
+                      size: 16,
+                      color: s.hovered
+                          ? GColors.foreground
+                          : GColors.mutedForeground,
                     ),
                   ),
                 ],
               ),
             ),
           ),
-          AnimatedCrossFade(
-            duration: const Duration(milliseconds: 180),
-            crossFadeState: _expanded
-                ? CrossFadeState.showFirst
-                : CrossFadeState.showSecond,
-            firstChild: Padding(
-              padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-              child: Column(
-                children: [
-                  Divider(
-                    height: 1,
-                    color: cs.onSurface.withValues(alpha: 0.1),
-                  ),
-                  const SizedBox(height: 10),
-                  ...effect.params.map(
-                    (param) => _EffectParamRow(
-                      param: param,
-                      accent: accent,
-                      enabled: enabled,
-                      onChanged: (val) => unawaited(
-                        PlaybackController.setEffectParam(
-                          effect.id,
-                          param.index,
-                          val,
+          AnimatedSize(
+            duration: GDurations.medium,
+            curve: GCurves.standard,
+            alignment: Alignment.topCenter,
+            child: _expanded
+                ? Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const GDivider(),
+                        const SizedBox(height: 8),
+                        for (final param in effect.params)
+                          _EffectParamRow(
+                            param: param,
+                            enabled: enabled,
+                            onChanged: (value) => unawaited(
+                              PlaybackController.setEffectParam(
+                                effect.id,
+                                param.index,
+                                value,
+                              ),
+                            ),
+                          ),
+                        const SizedBox(height: 4),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: GButton(
+                            label: 'Сбросить параметры',
+                            icon: LucideIcons.rotateCcw,
+                            variant: GButtonVariant.ghost,
+                            size: GButtonSize.sm,
+                            onPressed: () => unawaited(
+                              PlaybackController.resetEffect(effect.id),
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
-                  ),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton.icon(
-                      onPressed: () =>
-                          unawaited(PlaybackController.resetEffect(effect.id)),
-                      icon: const Icon(Icons.refresh_rounded, size: 14),
-                      label: const Text(
-                        'Сбросить параметры',
-                        style: TextStyle(fontSize: 11),
-                      ),
-                      style: TextButton.styleFrom(
-                        foregroundColor: cs.error.withValues(alpha: 0.7),
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            secondChild: const SizedBox(width: double.infinity),
+                  )
+                : const SizedBox(width: double.infinity),
           ),
         ],
       ),
@@ -714,101 +708,60 @@ class _EffectCardState extends State<_EffectCard> {
 
 class _EffectParamRow extends StatelessWidget {
   final EffectParamDto param;
-  final Color accent;
   final bool enabled;
   final ValueChanged<double> onChanged;
 
   const _EffectParamRow({
     required this.param,
-    required this.accent,
     required this.enabled,
     required this.onChanged,
   });
 
+  String _format(double value) => '${value.toStringAsFixed(1)}${param.unit}';
+
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     final isDefault = (param.value - param.defaultValue).abs() < 0.001;
+    // Rounded: e.g. (1 - 0) / 0.1 is 9.999… in floating point.
+    final steps = param.step > 0
+        ? ((param.max - param.min) / param.step).round()
+        : 0;
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
+    return SizedBox(
+      height: 36,
       child: Row(
         children: [
           SizedBox(
-            width: 88,
+            width: 96,
             child: Text(
               param.name,
-              style: TextStyle(
-                fontSize: 12,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+              style: GText.xs(color: GColors.mutedForeground),
+              maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          const SizedBox(width: 8),
           Expanded(
-            child: M3ESlider(
+            child: Slider(
               value: param.value.clamp(param.min, param.max),
               min: param.min,
               max: param.max,
-              divisions: param.step > 0
-                  ? ((param.max - param.min) / param.step).toInt()
-                  : null,
-              enabled: enabled,
-              decoration: M3ESliderDecoration(
-                colors: M3ESliderColors(
-                  thumbColor: enabled
-                      ? accent
-                      : cs.onSurface.withValues(alpha: 0.38),
-                  disabledThumbColor: cs.onSurface.withValues(alpha: 0.38),
-                  activeTrackColor: accent.withValues(
-                    alpha: enabled ? 0.7 : 0.3,
-                  ),
-                  inactiveTrackColor: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.12),
-                  disabledActiveTrackColor: accent.withValues(alpha: 0.3),
-                  disabledInactiveTrackColor: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.12),
-                  activeTickColor: accent.withValues(alpha: 0.7),
-                  inactiveTickColor: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.12),
-                  disabledActiveTickColor: cs.onSurface.withValues(alpha: 0.38),
-                  disabledInactiveTickColor: Theme.of(
-                    context,
-                  ).colorScheme.onSurface.withValues(alpha: 0.12),
-                ),
-                trackHeight: 4,
-                thumbWidth: 8,
-                thumbHeight: 16,
-              ),
+              divisions: steps > 0 ? steps : null,
+              semanticFormatterCallback: (value) =>
+                  '${param.name}: ${_format(value)}',
               onChanged: enabled ? onChanged : null,
             ),
           ),
+          const SizedBox(width: 8),
           SizedBox(
-            width: 56,
-            child: Container(
-              alignment: Alignment.center,
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: isDefault
-                    ? cs.onSurface.withValues(alpha: 0.05)
-                    : accent.withValues(alpha: 0.16),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                '${param.value.toStringAsFixed(1)}${param.unit}',
-                style: TextStyle(
-                  fontSize: 10,
-                  color: isDefault
-                      ? cs.onSurface.withValues(alpha: 0.38)
-                      : accent,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                ),
-                textAlign: TextAlign.center,
-                overflow: TextOverflow.ellipsis,
+            width: 64,
+            child: Text(
+              _format(param.value),
+              textAlign: TextAlign.right,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: GText.time(
+                color: isDefault ? GColors.mutedForeground : GColors.foreground,
               ),
             ),
           ),

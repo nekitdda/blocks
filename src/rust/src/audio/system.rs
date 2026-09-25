@@ -10,7 +10,10 @@ use crate::{
 };
 
 #[cfg(not(any(target_os = "android")))]
-use crate::audio::{discord::DiscordManager, smtc::SmtcManager};
+use crate::audio::{
+    discord::{DiscordHandle, DiscordManager},
+    smtc::SmtcManager,
+};
 
 use parking_lot::RwLock as PRwLock;
 use std::sync::Arc;
@@ -48,6 +51,15 @@ impl AbortOnDrop {
             h.abort();
         }
     }
+
+    /// Aborts the task and waits until its future is dropped, so whatever it
+    /// owns (e.g. the MPRIS D-Bus name) is released before the next session.
+    async fn stop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "android")))]
@@ -78,9 +90,13 @@ pub struct AudioSystem {
     signals: AudioSignals,
     tx: mpsc::Sender<AudioMessage>,
     db: Arc<tokio::sync::Mutex<crate::db::AppDatabase>>,
+    /// Device database, for settings shared by every account (output device).
+    device_db: Arc<tokio::sync::Mutex<crate::db::AppDatabase>>,
     context_generation: Arc<AtomicU64>,
     #[cfg(not(any(target_os = "android")))]
     smtc_guards: Vec<AbortOnDrop>,
+    #[cfg(not(any(target_os = "android")))]
+    discord: Option<DiscordHandle>,
 }
 
 impl AudioSystem {
@@ -88,6 +104,7 @@ impl AudioSystem {
         error_sink: Arc<dyn Fn(String) + Send + Sync>,
         api: Arc<ApiService>,
         db: Arc<tokio::sync::Mutex<crate::db::AppDatabase>>,
+        device_db: Arc<tokio::sync::Mutex<crate::db::AppDatabase>>,
         _http_cache: Arc<crate::storage::cache::HttpCache>,
         track_cache: Arc<crate::storage::cache::TrackCache>,
     ) -> Result<(
@@ -167,16 +184,21 @@ impl AudioSystem {
             signals: signals.clone(),
             tx: tx.clone(),
             db,
+            device_db,
             context_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(not(any(target_os = "android")))]
             smtc_guards: Vec::new(),
+            #[cfg(not(any(target_os = "android")))]
+            discord: None,
         };
 
         let mut system_loop = system;
 
         // Start Discord integration
         #[cfg(not(any(target_os = "android")))]
-        DiscordManager::spawn(signals.clone());
+        {
+            system_loop.discord = Some(DiscordManager::spawn(signals.clone()));
+        }
 
         // Background task for SMTC
         #[cfg(not(any(target_os = "android")))]
@@ -232,13 +254,24 @@ impl AudioSystem {
 
         // Main Audio Loop
         tokio::spawn(async move {
+            // The actor keeps a sender to itself, so the channel never closes
+            // on its own; sessions end it with `AudioMessage::Shutdown`.
+            let mut done = None;
             while let Some(msg) = rx.recv().await {
+                if let AudioMessage::Shutdown(notify) = msg {
+                    done = Some(notify);
+                    break;
+                }
                 system_loop.process_message(msg).await;
             }
-            // Channel closed on context teardown: stop SMTC loops and the
-            // controller monitor/playback task in a defined order instead
-            // of relying on Drop alone (Drop guards stay as a backstop).
+            // Stop SMTC loops and the controller monitor/playback task in a
+            // defined order, then drop the engine (output stream) before
+            // reporting back.
             system_loop.shutdown().await;
+            drop(system_loop);
+            if let Some(notify) = done {
+                notify.notify_one();
+            }
         });
 
         Ok((tx, signals, state, effect_handles))
@@ -288,13 +321,13 @@ impl AudioSystem {
         #[cfg(not(any(target_os = "android")))]
         {
             for g in &mut self.smtc_guards {
-                g.shutdown();
+                g.stop().await;
             }
-            // Stop the Discord poll thread: `spawn_blocking` cannot be aborted,
-            // so it needs an explicit flag, and leaving it running would pin a
-            // blocking-pool thread and (on re-init) open a second IPC
-            // connection with the same client id.
-            crate::audio::discord::shutdown();
+            // `spawn_blocking` cannot be aborted: the presence thread polls
+            // its own stop flag.
+            if let Some(discord) = self.discord.take() {
+                discord.shutdown();
+            }
         }
         self.controller.shutdown().await;
     }
@@ -649,7 +682,7 @@ impl AudioSystem {
             AudioMessage::SetAudioDevice(device_name) => {
                 self.signals.selected_device.set(device_name.clone());
                 // Don't hold the actor on a DB write; persist in background.
-                let db = self.db.clone();
+                let db = self.device_db.clone();
                 tokio::spawn(async move {
                     let mut db = db.lock().await;
                     let _ = db.save_setting("audio_device", &device_name).await;
@@ -659,6 +692,8 @@ impl AudioSystem {
             AudioMessage::RecreateStream => {
                 self.recreate_stream().await;
             }
+            // Intercepted by the actor loop before dispatch.
+            AudioMessage::Shutdown(_) => {}
             AudioMessage::ReloadCurrentTrack => {
                 self.reload_track().await;
             }

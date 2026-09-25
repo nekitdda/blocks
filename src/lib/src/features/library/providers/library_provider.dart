@@ -246,7 +246,7 @@ void onLikedTracksChanged(List<SimpleTrackDto> tracks) {
       .where(
         (t) =>
             t.title.toLowerCase().contains(query) ||
-            t.album.toLowerCase().contains(query) ||
+            (t.album ?? '').toLowerCase().contains(query) ||
             t.artists.any((a) => a.name.toLowerCase().contains(query)),
       )
       .toList();

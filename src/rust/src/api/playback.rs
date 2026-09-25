@@ -69,7 +69,8 @@ pub async fn seek(ctx: &AppContext, position_ms: u32) {
 
 pub async fn set_volume(ctx: &AppContext, volume: u8) {
     let _ = ctx.audio.tx.send(AudioMessage::SetVolume(volume)).await;
-    let db = ctx.core.db.clone();
+    // Volume follows the device, not the account.
+    let db = ctx.core.device_db.clone();
     tokio::spawn(async move {
         let mut db = db.lock().await;
         let _ = db.save_setting("volume", &volume).await;
@@ -107,13 +108,22 @@ pub async fn get_queue(ctx: &AppContext) -> Vec<SimpleTrackDto> {
     })
 }
 
-pub async fn get_history(ctx: &AppContext) -> Vec<SimpleTrackDto> {
+/// Recently played tracks of the signed-in account, newest first. Persisted
+/// in the account database, so it survives restarts and account switches.
+pub async fn get_history(ctx: &AppContext, limit: u32) -> Vec<SimpleTrackDto> {
     let (liked_ids, disliked_ids) = ctx.audio.state.read().await.liked.snapshot();
-    ctx.audio.signals.history.with(|h| {
-        h.iter()
-            .map(|t| SimpleTrackDto::from_yandex(t, &liked_ids, &disliked_ids))
-            .collect()
-    })
+    let items = {
+        let mut db = ctx.core.db.lock().await;
+        db.load_play_history(limit.clamp(1, 100)).await.unwrap_or_default()
+    };
+    items
+        .into_iter()
+        .map(|m| {
+            let is_liked = liked_ids.contains(&m.id);
+            let is_disliked = disliked_ids.contains(&m.id);
+            crate::api::library::metadata_to_dto(m, is_liked, is_disliked)
+        })
+        .collect()
 }
 
 pub async fn play_track(ctx: &AppContext, track_id: String) {

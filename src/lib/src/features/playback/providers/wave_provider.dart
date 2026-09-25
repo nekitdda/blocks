@@ -1,5 +1,4 @@
 import 'package:signals_flutter/signals_flutter.dart';
-import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
 import 'package:youmuz/src/features/core/services/rust_bridge.dart';
 import 'package:youmuz/src/rust/api/content.dart';
 import 'package:youmuz/src/rust/api/models.dart';
@@ -16,7 +15,6 @@ class WaveController {
     await runRustAction(
       (ctx) => rust_playback.startWave(ctx: ctx, seeds: [seed]),
     );
-    setSection(AppSection.home);
   }
 
   /// Toggle is fully owned by Rust (`toggle_wave_station`): no seed
@@ -31,7 +29,6 @@ class WaveController {
   /// when empty. Fully owned by Rust ([startMyWave]).
   static Future<void> startMyWave() async {
     await runRustAction((ctx) => rust_playback.startMyWave(ctx: ctx));
-    setSection(AppSection.home);
   }
 
   /// Reset to the default wave with a single Rust call.

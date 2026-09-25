@@ -1,11 +1,9 @@
 import 'dart:async';
-import 'dart:io' show File, Platform;
-import 'dart:typed_data';
+import 'dart:io' show Platform;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:youmuz/src/app/init.dart' show AppInit;
 import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
 import 'package:youmuz/src/features/core/providers/notification_provider.dart';
 import 'package:youmuz/src/features/core/providers/visual_effects_provider.dart';
@@ -48,6 +46,8 @@ Future<void> initPlayback() async {
       case rust.AppEvent_PlaybackProgress(field0: final progress):
         playerProgressSignal.value = progress;
       case rust.AppEvent_VibeTick(field0: final tick):
+        // Kept for consumers that opt in; the Graphite UI has no
+        // audio-reactive background.
         if (vibeVisibleSignal.value) {
           vibeTickSignal.value = tick;
         }
@@ -58,15 +58,14 @@ Future<void> initPlayback() async {
         onLikedTracksChanged(tracks);
       case rust.AppEvent_AccountUpdated(field0: final account):
         accountSignal.value = account;
+        unawaited(AppInit.refreshAccounts());
       case rust.AppEvent_Notification(field1: final message):
         showAppWarning(message);
       case rust.AppEvent_Error(field0: final message):
-        showAppError(message);
-        if (message.contains('Unauthorized') ||
-            message.contains('Invalid token') ||
-            message.contains('session expired') ||
-            message.contains('401')) {
-          unawaited(logout());
+        if (isUnauthorizedError(message) || message.contains('401')) {
+          unawaited(AppInit.handleSessionExpired());
+        } else {
+          showAppError(message);
         }
       case rust.AppEvent_TrackDownloadStarted(field0: final trackId):
         downloadingTracksSignal.value = {
@@ -93,9 +92,6 @@ Future<void> initPlayback() async {
 
   audioQualitySignal.value = await rust.getAudioQuality(ctx: ctx);
 
-  _activatePersistentColorScheme();
-  _activateAdjacentCoverPrecache();
-  _activateVibePalette();
   _activateBufferingDelay();
   _activateLyricsOverlayReset();
   _activateWifiLock();
@@ -111,8 +107,7 @@ void disposePlayback() {
   _eventSub = null;
   playerStateSignal.value = null;
   playerProgressSignal.value = null;
-  vibeTickSignal.value = F32Array26(0);
-  trackProgressSignal.value = (durationMs: 0, positionMs: 0);
+  vibeTickSignal.value = F32Array26.init();
   audioQualitySignal.value = AudioQuality.normal;
   // Cancel any in-flight volume flush so it cannot resurrect state after logout.
   _volumeFlushTimer?.cancel();
@@ -122,9 +117,6 @@ void disposePlayback() {
   _optimisticVolume.value = -1;
 }
 
-void _activatePersistentColorScheme() => _persistentColorSchemeEffect;
-void _activateAdjacentCoverPrecache() => _adjacentCoverPrecacheEffect;
-void _activateVibePalette() => _vibePaletteEffect;
 void _activateBufferingDelay() => _bufferingDelayEffect;
 void _activateLyricsOverlayReset() => _lyricsOverlayResetEffect;
 void _activateWifiLock() => _wifiLockEffect;
@@ -332,172 +324,6 @@ final FlutterComputed<SimpleTrackDto?> nextTrackSignal = computed(() {
   return null;
 }, options: const ComputedOptions(name: 'nextTrackSignal'));
 
-// Store color scheme, updated automatically when local cover URI changes
-final FlutterSignal<ColorScheme?> colorSchemeSignal = signal<ColorScheme?>(
-  null,
-);
-
-// Keep only the covers around the current queue position. Apart from avoiding
-// repeated palette extraction when going back, this lets the normal next-track
-// transition do its image work before the track actually changes.
-const int _preparedCoverCacheLimit = 6;
-final Map<String, ColorScheme> _preparedCoverSchemes = {};
-final Map<String, Future<ColorScheme?>> _preparingCoverSchemes = {};
-
-void _rememberCoverScheme(String url, ColorScheme scheme) {
-  _preparedCoverSchemes.remove(url);
-  _preparedCoverSchemes[url] = scheme;
-  while (_preparedCoverSchemes.length > _preparedCoverCacheLimit) {
-    _preparedCoverSchemes.remove(_preparedCoverSchemes.keys.first);
-  }
-}
-
-Future<ColorScheme?> _prepareCoverScheme(String url) {
-  final ready = _preparedCoverSchemes[url];
-  if (ready != null) {
-    // Refresh its position in the small LRU cache.
-    _rememberCoverScheme(url, ready);
-    return Future.value(ready);
-  }
-
-  final inFlight = _preparingCoverSchemes[url];
-  if (inFlight != null) return inFlight;
-
-  final future = () async {
-    try {
-      final ctx = appContextSignal.value;
-      if (ctx == null) return null;
-
-      final path = await rust.getCachedImagePath(ctx: ctx, url: url);
-      if (path == null) return null;
-
-      final file = File(path);
-      final paletteProvider = ResizeImage(
-        FileImage(file),
-        width: 32,
-        height: 32,
-      );
-      final scheme = await ColorScheme.fromImageProvider(
-        provider: paletteProvider,
-        brightness: Brightness.dark,
-      );
-      _rememberCoverScheme(url, scheme);
-
-      // Warm the exact decoded size used by BlurredCoverBackground. Resolving
-      // an ImageProvider is enough to put it into Flutter's shared image cache.
-      final backgroundProvider = ResizeImage(
-        FileImage(file),
-        width: 60,
-        height: 60,
-      );
-      final stream = backgroundProvider.resolve(ImageConfiguration.empty);
-      late final ImageStreamListener listener;
-      listener = ImageStreamListener(
-        (_, _) => stream.removeListener(listener),
-        onError: (_, _) => stream.removeListener(listener),
-      );
-      stream.addListener(listener);
-
-      return scheme;
-    } on Object catch (error) {
-      debugPrint('Cover preparation failed: $error');
-      return null;
-    }
-  }();
-
-  _preparingCoverSchemes[url] = future;
-  unawaited(
-    future.then((_) {
-      unawaited(_preparingCoverSchemes.remove(url));
-    }),
-  );
-  return future;
-}
-
-// Effect to update the scheme, normally from the already prepared queue entry.
-final EffectCleanup _persistentColorSchemeEffect = effect(() {
-  final url = currentCoverUrlSignal();
-
-  if (url == null || appContextSignal.value == null) {
-    colorSchemeSignal.value = null;
-    return;
-  }
-
-  final ready = _preparedCoverSchemes[url];
-  if (ready != null) {
-    _rememberCoverScheme(url, ready);
-    colorSchemeSignal.value = ready;
-    return;
-  }
-
-  unawaited(() async {
-    final scheme = await _prepareCoverScheme(url);
-    if (scheme == null) return;
-
-    // Check if the track hasn't changed while preparation was in flight.
-    if (currentCoverUrlSignal() == url) {
-      colorSchemeSignal.value = scheme;
-    }
-  }());
-});
-
-// Queue updates happen well ahead of playback. Prepare both neighbours so
-// next/previous buttons and automatic advancement don't decode on transition.
-final EffectCleanup _adjacentCoverPrecacheEffect = effect(() {
-  final previousUrl = previousTrackSignal()?.coverUrl;
-  final nextUrl = nextTrackSignal()?.coverUrl;
-  if (previousUrl != null) unawaited(_prepareCoverScheme(previousUrl));
-  if (nextUrl != null && nextUrl != previousUrl) {
-    unawaited(_prepareCoverScheme(nextUrl));
-  }
-});
-
-// Material Orange 500 is the stable fallback before a cover palette is ready.
-const Color defaultAccentColor = Color(0xFFFF9800);
-
-// Accent color
-final FlutterComputed<Color> accentColorSignal = computed(
-  () => colorSchemeSignal()?.primary ?? defaultAccentColor,
-  options: const ComputedOptions(name: 'accentColorSignal'),
-);
-
-// Player bar background color
-final FlutterComputed<Color> playerBarColorSignal = computed(
-  () =>
-      Color.lerp(
-        colorSchemeSignal()?.surfaceContainerHighest,
-        Colors.black,
-        0.4,
-      ) ??
-      const Color(0xFF181818),
-  options: const ComputedOptions(name: 'playerBarColorSignal'),
-);
-
-// Sync palette with Rust for Vibe effect
-final EffectCleanup _vibePaletteEffect = effect(() {
-  final scheme = colorSchemeSignal();
-  final ctx = appContextSignal.value;
-  if (scheme != null && ctx != null) {
-    List<double> c(Color col) => [col.r, col.g, col.b];
-    final p = [
-      ...c(scheme.primary),
-      ...c(scheme.secondary),
-      ...c(scheme.tertiary),
-      ...c(scheme.primaryContainer),
-      ...c(scheme.secondaryContainer),
-      ...c(scheme.tertiaryContainer),
-    ];
-    unawaited(
-      rust
-          .setVibePalette(
-            ctx: ctx,
-            colors: Float32List.fromList(p),
-          )
-          .catchError((e) => debugPrint('vibe palette push failed: $e')),
-    );
-  }
-});
-
 // Buffering indicator that only shows once the track has been stalled > 3s,
 // to avoid flickering on short buffering hiccups.
 Timer? _bufferingDelayTimer;
@@ -645,6 +471,11 @@ class PlaybackController {
           ],
         ),
       );
+
+  /// Rotor station built around one artist.
+  static Future<void> startArtistWave(String artistId) => runRustAction(
+    (ctx) => rust.startWave(ctx: ctx, seeds: ['artist:$artistId']),
+  );
   /// Throttled volume push.
   ///
   /// The slider's `onChanged` fires per pointer frame; each call was an FFI

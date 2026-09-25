@@ -99,7 +99,7 @@ pub async fn set_discord_rpc_enabled(ctx: &AppContext, enabled: bool) {
 }
 
 pub async fn is_custom_titlebar_enabled(ctx: &AppContext) -> bool {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     db.load_setting("custom_titlebar")
         .await
         .unwrap_or(Some(true))
@@ -107,14 +107,14 @@ pub async fn is_custom_titlebar_enabled(ctx: &AppContext) -> bool {
 }
 
 pub async fn set_custom_titlebar_enabled(ctx: &AppContext, enabled: bool) {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     if let Err(e) = db.save_setting("custom_titlebar", &enabled).await {
         tracing::error!("Failed to save custom_titlebar setting: {:?}", e);
     }
 }
 
 pub async fn is_auto_hide_navbar_enabled(ctx: &AppContext) -> bool {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     db.load_setting("auto_hide_navbar")
         .await
         .unwrap_or(Some(false))
@@ -122,14 +122,14 @@ pub async fn is_auto_hide_navbar_enabled(ctx: &AppContext) -> bool {
 }
 
 pub async fn set_auto_hide_navbar_enabled(ctx: &AppContext, enabled: bool) {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     if let Err(e) = db.save_setting("auto_hide_navbar", &enabled).await {
         tracing::error!("Failed to save auto_hide_navbar setting: {:?}", e);
     }
 }
 
 pub async fn is_close_to_tray_enabled(ctx: &AppContext) -> bool {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     db.load_setting("close_to_tray")
         .await
         .unwrap_or(Some(true))
@@ -137,7 +137,7 @@ pub async fn is_close_to_tray_enabled(ctx: &AppContext) -> bool {
 }
 
 pub async fn set_close_to_tray_enabled(ctx: &AppContext, enabled: bool) {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     if let Err(e) = db.save_setting("close_to_tray", &enabled).await {
         tracing::error!("Failed to save close_to_tray setting: {:?}", e);
     }
@@ -206,7 +206,7 @@ pub async fn set_audio_device(ctx: &AppContext, device_name: String) {
 }
 
 pub async fn is_update_check_enabled(ctx: &AppContext) -> bool {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     db.load_setting("update_check")
         .await
         .unwrap_or(Some(true))
@@ -214,7 +214,7 @@ pub async fn is_update_check_enabled(ctx: &AppContext) -> bool {
 }
 
 pub async fn set_update_check_enabled(ctx: &AppContext, enabled: bool) {
-    let mut db = ctx.core.db.lock().await;
+    let mut db = ctx.core.device_db.lock().await;
     if let Err(e) = db.save_setting("update_check", &enabled).await {
         tracing::error!("Failed to save update_check setting: {:?}", e);
     }
@@ -223,7 +223,7 @@ pub async fn set_update_check_enabled(ctx: &AppContext, enabled: bool) {
 pub async fn set_vibe_animation_enabled(ctx: &AppContext, enabled: bool) {
     let _ = ctx
         .core
-        .db
+        .device_db
         .lock()
         .await
         .save_setting("vibe_animation_enabled", &enabled)
@@ -234,7 +234,7 @@ pub async fn set_vibe_render_scale(ctx: &AppContext, scale: f64) {
     let scale = scale.clamp(0.25, 0.50);
     let _ = ctx
         .core
-        .db
+        .device_db
         .lock()
         .await
         .save_setting("vibe_render_scale", &scale)
@@ -244,7 +244,7 @@ pub async fn set_vibe_render_scale(ctx: &AppContext, scale: f64) {
 pub async fn set_blur_effects_enabled(ctx: &AppContext, enabled: bool) {
     let _ = ctx
         .core
-        .db
+        .device_db
         .lock()
         .await
         .save_setting("blur_effects_enabled", &enabled)

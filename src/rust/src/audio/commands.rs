@@ -59,4 +59,7 @@ pub enum AudioMessage {
     ReloadCurrentTrack,
     TrackEnded,
     RecreateStream,
+    /// Ends the actor loop (session teardown). The actor releases the output
+    /// stream and media-session integration, then notifies.
+    Shutdown(std::sync::Arc<tokio::sync::Notify>),
 }

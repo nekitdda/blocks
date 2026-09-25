@@ -1,21 +1,61 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
+import 'package:youmuz/src/features/auth/views/add_account.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
 import 'package:youmuz/src/features/core/providers/notification_provider.dart';
-import 'package:youmuz/src/features/core/providers/visual_effects_provider.dart';
 import 'package:youmuz/src/features/core/services/global_hotkey_service.dart';
-import 'package:youmuz/src/features/core/theme/app_tokens.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
-import 'package:youmuz/src/features/core/views/widgets/responsive.dart';
 import 'package:youmuz/src/features/library/providers/library_provider.dart';
 import 'package:youmuz/src/features/settings/views/lyrics_providers_dialog.dart';
+import 'package:youmuz/src/features/settings/views/update_dialog.dart';
 import 'package:youmuz/src/rust/api/content.dart' as rust;
+import 'package:youmuz/src/rust/api/models.dart';
 import 'package:youmuz/src/rust/api/simple.dart' as simple;
+import 'package:youmuz/src/rust/app/context.dart';
+import 'package:youmuz/src/ui/ui.dart';
+
+const _repositoryUrl = 'https://github.com/nekitdda/YouMuz';
+
+const _accountsNote =
+    'Каждый аккаунт хранит собственную сессию, медиатеку, историю и настройки '
+    'звука (качество, эквалайзер, эффекты, Discord, источники текстов). '
+    'Настройки окна, трея, горячих клавиш и громкость общие для устройства.';
+
+const _removeAccountMessage =
+    'Аккаунт будет удалён с этого устройства вместе с его локальными данными: '
+    'кэшем медиатеки, историей, настройками звука и скачанными треками.';
+
+const _chevron = Icon(
+  LucideIcons.chevronRight,
+  size: 16,
+  color: GColors.mutedForeground,
+);
+
+/// `focus-visible:ring-1 ring-ring` for full-width rows.
+const _focusRing = BoxDecoration(
+  border: Border.fromBorderSide(BorderSide(color: GColors.ring)),
+);
+
+bool get _isDesktop =>
+    Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+
+String _formatBytes(int bytes) {
+  if (bytes <= 0) return '0 Б';
+  const suffixes = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  var i = 0;
+  var size = bytes.toDouble();
+  while (size >= 1024 && i < suffixes.length - 1) {
+    size /= 1024;
+    i++;
+  }
+  return '${size.toStringAsFixed(1)} ${suffixes[i]}';
+}
 
 class SettingsView extends StatefulWidget {
   const SettingsView({super.key});
@@ -25,595 +65,857 @@ class SettingsView extends StatefulWidget {
 }
 
 class _SettingsViewState extends State<SettingsView> {
-  late final FutureSignal<String?> _pathSignal;
-  late final FutureSignal<int> _cacheSizeSignal;
-  late final FutureSignal<int> _trackCacheSizeSignal;
-  late final FutureSignal<String> _versionSignal;
-  late final FutureSignal<bool> _discordRpcSignal;
-  late final FutureSignal<bool> _customTitlebarSignal;
-  late final FutureSignal<bool> _autoHideNavbarSignal;
-  late final FutureSignal<bool> _closeToTraySignal;
-  late final FutureSignal<bool> _updateCheckSignal;
+  final _scrollController = ScrollController();
+  late final EffectCleanup _disposeSessionEffect;
+
+  // Read from the open session and reloaded whenever the account changes, so
+  // one account's values never show up (or get written back) under another.
+  AsyncState<String?> _downloadPath = const AsyncLoading();
+  AsyncState<int> _cacheSize = const AsyncLoading();
+  AsyncState<int> _trackCacheSize = const AsyncLoading();
+  AsyncState<bool> _discordRpc = const AsyncLoading();
+  AsyncState<bool> _customTitlebar = const AsyncLoading();
+  AsyncState<bool> _updateCheck = const AsyncLoading();
+
+  String? _version;
+  bool _clearingCache = false;
+  bool _clearingTracks = false;
 
   @override
   void initState() {
     super.initState();
-    _pathSignal = futureSignal(() async {
+    _disposeSessionEffect = effect(() {
       final ctx = appContextSignal.value;
-      if (ctx == null) return null;
-      return await rust.getDownloadPath(ctx: ctx);
+      untracked(() => _loadSessionValues(ctx));
     });
-    _cacheSizeSignal = futureSignal(() async {
-      final ctx = appContextSignal.value;
-      if (ctx == null) return 0;
-      return await simple.getCacheSize(ctx: ctx);
-    });
-    _trackCacheSizeSignal = futureSignal(() async {
-      final ctx = appContextSignal.value;
-      if (ctx == null) return 0;
-      return await simple.getTrackCacheSize(ctx: ctx);
-    });
-    _versionSignal = futureSignal(() async {
-      return await simple.getAppVersion();
-    });
-    _discordRpcSignal = futureSignal(() async {
-      final ctx = appContextSignal.value;
-      if (ctx == null) return false;
-      return await simple.isDiscordRpcEnabled(ctx: ctx);
-    });
-    _customTitlebarSignal = futureSignal(() async {
-      final ctx = appContextSignal.value;
-      if (ctx == null) return true;
-      return await simple.isCustomTitlebarEnabled(ctx: ctx);
-    });
-    _autoHideNavbarSignal = futureSignal(
-      () => Future.value(autoHideNavbarSignal.value),
-    );
-    _closeToTraySignal = futureSignal(
-      () => Future.value(closeToTraySignal.value),
-    );
-    _updateCheckSignal = futureSignal(() async {
-      final ctx = appContextSignal.value;
-      if (ctx == null) return true;
-      return await simple.isUpdateCheckEnabled(ctx: ctx);
-    });
+    unawaited(_loadVersion());
   }
 
-  Future<void> _toggleDiscordRpc(bool enabled) async {
-    final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setDiscordRpcEnabled(ctx: ctx, enabled: enabled);
-      unawaited(_discordRpcSignal.refresh());
+  @override
+  void dispose() {
+    _disposeSessionEffect();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadVersion() async {
+    try {
+      final version = await simple.getAppVersion();
+      if (mounted) setState(() => _version = version);
+    } on Object catch (e) {
+      debugPrint('Failed to read the app version: $e');
     }
   }
 
-  Future<void> _toggleCustomTitlebar(bool enabled) async {
+  void _loadSessionValues(AppContext? ctx) {
+    setState(() {
+      _downloadPath = const AsyncLoading();
+      _cacheSize = const AsyncLoading();
+      _trackCacheSize = const AsyncLoading();
+      _discordRpc = const AsyncLoading();
+      _customTitlebar = const AsyncLoading();
+      _updateCheck = const AsyncLoading();
+    });
+    if (ctx == null) return;
+    unawaited(_loadDownloadPath(ctx));
+    unawaited(_loadCacheSize(ctx));
+    unawaited(_loadTrackCacheSize(ctx));
+    unawaited(_loadDiscordRpc(ctx));
+    unawaited(_loadCustomTitlebar(ctx));
+    unawaited(_loadUpdateCheck(ctx));
+  }
+
+  Future<void> _loadDownloadPath(AppContext ctx) => _fetch(
+    ctx,
+    (c) => rust.getDownloadPath(ctx: c),
+    (s) => _downloadPath = s,
+  );
+
+  Future<void> _loadCacheSize(AppContext ctx) =>
+      _fetch(ctx, (c) => simple.getCacheSize(ctx: c), (s) => _cacheSize = s);
+
+  Future<void> _loadTrackCacheSize(AppContext ctx) => _fetch(
+    ctx,
+    (c) => simple.getTrackCacheSize(ctx: c),
+    (s) => _trackCacheSize = s,
+  );
+
+  Future<void> _loadDiscordRpc(AppContext ctx) => _fetch(
+    ctx,
+    (c) => simple.isDiscordRpcEnabled(ctx: c),
+    (s) => _discordRpc = s,
+  );
+
+  Future<void> _loadCustomTitlebar(AppContext ctx) => _fetch(
+    ctx,
+    (c) => simple.isCustomTitlebarEnabled(ctx: c),
+    (s) => _customTitlebar = s,
+  );
+
+  Future<void> _loadUpdateCheck(AppContext ctx) => _fetch(
+    ctx,
+    (c) => simple.isUpdateCheckEnabled(ctx: c),
+    (s) => _updateCheck = s,
+  );
+
+  /// Applies the result of [fetch] unless the view is gone or another
+  /// account's session was opened meanwhile.
+  Future<void> _fetch<T>(
+    AppContext ctx,
+    Future<T> Function(AppContext ctx) fetch,
+    void Function(AsyncState<T> state) apply,
+  ) async {
+    AsyncState<T> state;
+    try {
+      state = AsyncState.data(await fetch(ctx));
+    } on Object catch (e, st) {
+      state = AsyncState.error(e, st);
+    }
+    if (!mounted || !identical(appContextSignal.value, ctx)) return;
+    setState(() => apply(state));
+  }
+
+  Future<bool> _trySave(Future<void> Function() save) async {
+    try {
+      await save();
+      return true;
+    } on Object catch (e) {
+      showAppError('Не удалось сохранить настройку: $e');
+      return false;
+    }
+  }
+
+  Future<void> _setDiscordRpc(bool enabled) async {
     final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setCustomTitlebarEnabled(ctx: ctx, enabled: enabled);
-      unawaited(_customTitlebarSignal.refresh());
+    if (ctx == null) return;
+    setState(() => _discordRpc = AsyncState.data(enabled));
+    await _trySave(
+      () => simple.setDiscordRpcEnabled(ctx: ctx, enabled: enabled),
+    );
+    await _loadDiscordRpc(ctx);
+  }
+
+  Future<void> _setCustomTitlebar(bool enabled) async {
+    final ctx = appContextSignal.value;
+    if (ctx == null) return;
+    setState(() => _customTitlebar = AsyncState.data(enabled));
+    final saved = await _trySave(
+      () => simple.setCustomTitlebarEnabled(ctx: ctx, enabled: enabled),
+    );
+    await _loadCustomTitlebar(ctx);
+    if (saved) {
       showAppSuccess('Изменения вступят в силу после перезапуска приложения');
     }
   }
 
-  Future<void> _toggleAutoHideNavbar(bool enabled) async {
+  Future<void> _setCloseToTray(bool enabled) async {
     final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setAutoHideNavbarEnabled(ctx: ctx, enabled: enabled);
-      // No `.refresh()`: the tracked read of `autoHideNavbarSignal` inside
-      // `_autoHideNavbarSignal` already re-runs the future on this write, so
-      // refreshing too did the work twice.
-      autoHideNavbarSignal.value = enabled;
-    }
-  }
-
-  Future<void> _toggleCloseToTray(bool enabled) async {
-    final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setCloseToTrayEnabled(ctx: ctx, enabled: enabled);
-      closeToTraySignal.value = enabled;
-    }
-  }
-
-  Future<void> _toggleUpdateCheck(bool enabled) async {
-    final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setUpdateCheckEnabled(ctx: ctx, enabled: enabled);
-      unawaited(_updateCheckSignal.refresh());
-    }
-  }
-
-  Future<void> _toggleVibeVisibility(bool enabled) async {
-    vibeVisibleSignal.value = enabled;
-    final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setVibeAnimationEnabled(ctx: ctx, enabled: enabled);
-    }
-  }
-
-  Future<void> _saveVibeRenderScale(double scale) async {
-    final normalized = scale.clamp(
-      minVibeRenderScale,
-      maxVibeRenderScale,
+    if (ctx == null) return;
+    final saved = await _trySave(
+      () => simple.setCloseToTrayEnabled(ctx: ctx, enabled: enabled),
     );
-    vibeRenderScaleSignal.value = normalized;
+    if (saved) closeToTraySignal.value = enabled;
+  }
+
+  Future<void> _setUpdateCheck(bool enabled) async {
     final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setVibeRenderScale(ctx: ctx, scale: normalized);
-    }
+    if (ctx == null) return;
+    setState(() => _updateCheck = AsyncState.data(enabled));
+    await _trySave(
+      () => simple.setUpdateCheckEnabled(ctx: ctx, enabled: enabled),
+    );
+    await _loadUpdateCheck(ctx);
   }
 
-  Future<void> _toggleBlurEffects(bool enabled) async {
-    blurEffectsEnabledSignal.value = enabled;
+  Future<void> _pickDownloadPath() async {
+    String? picked;
+    try {
+      picked = await FilePicker.getDirectoryPath();
+    } on Object catch (e) {
+      showAppError('Не удалось открыть выбор папки: $e');
+      return;
+    }
+    final path = picked;
+    if (path == null) return;
     final ctx = appContextSignal.value;
-    if (ctx != null) {
-      await simple.setBlurEffectsEnabled(ctx: ctx, enabled: enabled);
+    if (ctx == null) return;
+    if (await _trySave(() => rust.setDownloadPath(ctx: ctx, path: path))) {
+      await _loadDownloadPath(ctx);
     }
-  }
-
-  Future<void> _pickPath() async {
-    final result = await FilePicker.getDirectoryPath();
-    if (result != null) {
-      final ctx = appContextSignal.value;
-      if (ctx != null) {
-        await rust.setDownloadPath(ctx: ctx, path: result);
-        unawaited(_pathSignal.refresh());
-      }
-    }
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes <= 0) return '0 Б';
-    const suffixes = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
-    var i = 0;
-    var size = bytes.toDouble();
-    while (size >= 1024 && i < suffixes.length - 1) {
-      size /= 1024;
-      i++;
-    }
-    return '${size.toStringAsFixed(1)} ${suffixes[i]}';
   }
 
   Future<void> _clearCache() async {
     final ctx = appContextSignal.value;
-    if (ctx == null) return;
-    await simple.clearCache(ctx: ctx);
-    unawaited(_cacheSizeSignal.refresh());
-    showAppSuccess('Кэш успешно очищен');
+    if (ctx == null || _clearingCache) return;
+    setState(() => _clearingCache = true);
+    try {
+      await simple.clearCache(ctx: ctx);
+      showAppSuccess('Кэш успешно очищен');
+    } on Object catch (e) {
+      showAppError('Не удалось очистить кэш: $e');
+    } finally {
+      if (mounted) setState(() => _clearingCache = false);
+    }
+    await _loadCacheSize(ctx);
   }
 
   Future<void> _clearTrackCache() async {
     final ctx = appContextSignal.value;
-    if (ctx == null) return;
-    await simple.clearTrackCache(ctx: ctx);
-    unawaited(_trackCacheSizeSignal.refresh());
-    // Also notify the downloaded tracks signal
-    unawaited(refreshDownloadedTracks());
-    showAppSuccess('Скачанные треки успешно удалены');
+    if (ctx == null || _clearingTracks) return;
+    final confirmed = await showGConfirm(
+      context,
+      title: 'Удалить скачанные треки?',
+      message:
+          'Треки, скачанные для прослушивания без интернета в этом аккаунте, '
+          'будут удалены с устройства.',
+      confirmLabel: 'Удалить',
+      destructive: true,
+    );
+    // The confirmation was for this account's downloads only.
+    if (!confirmed || !mounted || !identical(appContextSignal.value, ctx)) {
+      return;
+    }
+    setState(() => _clearingTracks = true);
+    try {
+      await simple.clearTrackCache(ctx: ctx);
+      unawaited(refreshDownloadedTracks());
+      showAppSuccess('Скачанные треки успешно удалены');
+    } on Object catch (e) {
+      showAppError('Не удалось удалить скачанные треки: $e');
+    } finally {
+      if (mounted) setState(() => _clearingTracks = false);
+    }
+    await _loadTrackCacheSize(ctx);
+  }
+
+  Future<void> _openRepository() async {
+    try {
+      final opened = await launchUrl(
+        Uri.parse(_repositoryUrl),
+        mode: LaunchMode.externalApplication,
+      );
+      if (!opened) showAppError('Не удалось открыть ссылку');
+    } on Object catch (e) {
+      showAppError('Не удалось открыть ссылку: $e');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
-    final cs = Theme.of(context).colorScheme;
+    // Switches need a Material ancestor regardless of the surrounding layout.
+    return Material(
+      type: MaterialType.transparency,
+      child: GScrollPage(
+        controller: _scrollController,
+        maxWidth: 880,
+        children: [
+          Semantics(
+            header: true,
+            child: Text('Настройки', style: GText.headline(30)),
+          ),
+          const SizedBox(height: 32),
+          const _AccountsSection(),
+          const SizedBox(height: 32),
+          _buildListening(),
+          if (_isDesktop) ...[
+            const SizedBox(height: 32),
+            _buildWindowAndSystem(),
+          ],
+          const SizedBox(height: 32),
+          _buildStorage(),
+          const SizedBox(height: 32),
+          _buildAbout(),
+        ],
+      ),
+    );
+  }
 
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      body: CustomScrollView(
-        slivers: [
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: EdgeInsets.fromLTRB(
-                isNarrow ? 20 : 40,
-                isNarrow ? 20 : 60,
-                isNarrow ? 20 : 40,
-                isNarrow ? 20 : 40,
-              ),
-              child: Text(
-                'Настройки',
-                style: Theme.of(context).textTheme.displayMedium?.copyWith(
-                  fontSize: isNarrow ? 28 : 48,
-                  fontWeight: FontWeight.w900,
-                  color: cs.onSurface,
-                  letterSpacing: -1,
-                ),
+  Widget _buildListening() {
+    return _SettingsSection(
+      label: 'Прослушивание',
+      children: [
+        _SettingsRow(
+          title: 'Источники текста песен',
+          description: 'Сервисы, в которых ищется синхронизированный текст',
+          trailing: _chevron,
+          onTap: () => LyricsProvidersDialog.show(context),
+        ),
+        if (_isDesktop)
+          _SwitchRow(
+            title: 'Discord Rich Presence',
+            description: 'Показывать текущий трек в статусе Discord',
+            value: _discordRpc.value ?? true,
+            enabled: !_discordRpc.isLoading,
+            onChanged: (v) => unawaited(_setDiscordRpc(v)),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildWindowAndSystem() {
+    return _SettingsSection(
+      label: 'Окно и система',
+      children: [
+        _SwitchRow(
+          title: 'Собственная рамка окна',
+          description:
+              'Отключает стандартную рамку ОС. Применяется после перезапуска',
+          value: _customTitlebar.value ?? false,
+          enabled: !_customTitlebar.isLoading,
+          onChanged: (v) => unawaited(_setCustomTitlebar(v)),
+        ),
+        SignalBuilder(
+          builder: (context) => _SwitchRow(
+            title: 'Сворачивать в трей при закрытии',
+            description:
+                'При нажатии на крестик приложение будет скрыто в трей',
+            value: closeToTraySignal.value,
+            onChanged: (v) => unawaited(_setCloseToTray(v)),
+          ),
+        ),
+        if (GlobalHotkeyService.isSupported)
+          _SettingsRow(
+            title: 'Горячие клавиши',
+            description: 'Глобальные сочетания клавиш, работающие вне окна',
+            trailing: _chevron,
+            onTap: () => unawaited(
+              showGDialog<void>(
+                context,
+                builder: (context) => const _GlobalHotkeysDialog(),
               ),
             ),
           ),
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: EdgeInsets.symmetric(
-                horizontal: context.horizontalPadding,
+      ],
+    );
+  }
+
+  Widget _buildStorage() {
+    String sizeLabel(AsyncState<int> size) => size.map(
+      data: (bytes) => 'Занято: ${_formatBytes(bytes)}',
+      error: (_, _) => 'Ошибка при получении размера',
+      loading: () => 'Подсчёт…',
+    );
+
+    return _SettingsSection(
+      label: 'Хранилище',
+      children: [
+        _SettingsRow(
+          title: 'Путь для сохранения треков',
+          description: _downloadPath.value ?? 'По умолчанию (Загрузки)',
+          trailing: GButton(
+            label: 'Изменить',
+            size: GButtonSize.sm,
+            variant: GButtonVariant.secondary,
+            onPressed: () => unawaited(_pickDownloadPath()),
+          ),
+        ),
+        _SettingsRow(
+          title: 'Кэш изображений и данных',
+          description: sizeLabel(_cacheSize),
+          trailing: GButton(
+            label: 'Очистить',
+            size: GButtonSize.sm,
+            variant: GButtonVariant.secondary,
+            loading: _clearingCache,
+            onPressed: () => unawaited(_clearCache()),
+          ),
+        ),
+        _SettingsRow(
+          title: 'Скачанные треки',
+          description: '${sizeLabel(_trackCacheSize)} · в этом аккаунте',
+          trailing: GButton(
+            label: 'Удалить',
+            size: GButtonSize.sm,
+            variant: GButtonVariant.destructive,
+            loading: _clearingTracks,
+            onPressed: () => unawaited(_clearTrackCache()),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAbout() {
+    return _SettingsSection(
+      label: 'О приложении',
+      children: [
+        _SettingsRow(
+          leading: const _AppMark(),
+          title: 'YouMuz',
+          description: 'Альтернативный клиент для Яндекс Музыки',
+          trailing: Text(
+            _version == null ? '…' : 'Версия $_version',
+            style: GText.time(size: 12),
+          ),
+        ),
+        _SwitchRow(
+          title: 'Проверка обновлений при запуске',
+          description: 'Проверять наличие новых версий на GitHub при запуске',
+          value: _updateCheck.value ?? true,
+          enabled: !_updateCheck.isLoading,
+          onChanged: (v) => unawaited(_setUpdateCheck(v)),
+        ),
+        _SettingsRow(
+          title: 'Обновления',
+          description: 'Сравнить установленную версию с последним релизом',
+          trailing: GButton(
+            label: 'Проверить',
+            size: GButtonSize.sm,
+            variant: GButtonVariant.secondary,
+            onPressed: () => UpdateDialog.show(context),
+          ),
+        ),
+        _SettingsRow(
+          title: 'Исходный код',
+          description: 'github.com/nekitdda/YouMuz',
+          trailing: const Icon(
+            LucideIcons.arrowUpRight,
+            size: 16,
+            color: GColors.mutedForeground,
+          ),
+          onTap: () => unawaited(_openRepository()),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+class _AccountsSection extends StatefulWidget {
+  const _AccountsSection();
+
+  @override
+  State<_AccountsSection> createState() => _AccountsSectionState();
+}
+
+class _AccountsSectionState extends State<_AccountsSection> {
+  /// Account this screen is currently switching to or removing.
+  int? _pendingUid;
+
+  Future<void> _open(StoredAccountDto account) async {
+    if (account.needsLogin) {
+      // The stored token was rejected: signing in again replaces it.
+      await showAddAccountFlow(context);
+      return;
+    }
+    await _runFor(account.uid, () => switchAccount(account.uid));
+  }
+
+  Future<void> _remove(StoredAccountDto account) async {
+    final confirmed = await showGConfirm(
+      context,
+      title: 'Выйти из аккаунта?',
+      message: _removeAccountMessage,
+      confirmLabel: 'Выйти',
+      destructive: true,
+    );
+    if (!confirmed) return;
+    await _runFor(account.uid, () => removeAccount(account.uid));
+  }
+
+  Future<void> _runFor(int uid, Future<void> Function() action) async {
+    if (mounted) setState(() => _pendingUid = uid);
+    try {
+      await action();
+    } finally {
+      if (mounted) setState(() => _pendingUid = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final accounts = accountsSignal.value;
+        final activeUid = activeAccountUidSignal.value;
+        final busy = sessionTransitionSignal.value;
+
+        return _SettingsSection(
+          label: 'Аккаунты',
+          note: _accountsNote,
+          children: [
+            if (accounts.isEmpty)
+              const _SettingsRow(
+                title: 'Нет сохранённых аккаунтов',
+                description: 'Добавьте аккаунт Яндекса, чтобы войти в него',
               ),
+            for (final account in accounts)
+              _buildRow(account, activeUid: activeUid, busy: busy),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: GButton(
+                  label: 'Добавить аккаунт',
+                  icon: LucideIcons.userPlus,
+                  variant: GButtonVariant.secondary,
+                  onPressed: busy
+                      ? null
+                      : () => unawaited(showAddAccountFlow(context)),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildRow(
+    StoredAccountDto account, {
+    required int? activeUid,
+    required bool busy,
+  }) {
+    final active = activeUid == null
+        ? account.isActive
+        : account.uid == activeUid;
+    return _AccountRow(
+      account: account,
+      active: active,
+      pending: busy && _pendingUid == account.uid,
+      onTap: busy || active ? null : () => unawaited(_open(account)),
+      onRemove: busy ? null : () => unawaited(_remove(account)),
+    );
+  }
+}
+
+class _AccountRow extends StatelessWidget {
+  const _AccountRow({
+    required this.account,
+    required this.active,
+    required this.pending,
+    required this.onTap,
+    required this.onRemove,
+  });
+
+  final StoredAccountDto account;
+  final bool active;
+  final bool pending;
+  final VoidCallback? onTap;
+  final VoidCallback? onRemove;
+
+  static const double _avatarSize = 36;
+
+  @override
+  Widget build(BuildContext context) {
+    final name = accountDisplayName(account);
+    final login = account.login.trim();
+    final subtitle = login.isNotEmpty && login != name
+        ? login
+        : 'ID ${account.uid}';
+
+    return GPressable(
+      onTap: onTap,
+      selected: active,
+      semanticLabel: active
+          ? '$name, текущий аккаунт'
+          : account.needsLogin
+          ? 'Войти снова: $name'
+          : 'Переключиться на $name',
+      builder: (context, s) => AnimatedContainer(
+        duration: GDurations.fast,
+        curve: GCurves.standard,
+        color: s.highlighted ? GColors.secondary : const Color(0x00000000),
+        foregroundDecoration: s.focused ? _focusRing : null,
+        padding: const EdgeInsets.fromLTRB(16, 12, 10, 12),
+        child: Row(
+          children: [
+            // The active ring adds 3.5px per side; a shared box keeps names
+            // aligned across rows.
+            SizedBox.square(
+              dimension: _avatarSize + 7,
+              child: Center(
+                child: GAvatar(
+                  name: name,
+                  url: account.avatarUrl,
+                  size: _avatarSize,
+                  ring: active,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const _SectionTitle(title: 'Загрузки'),
-                  const SizedBox(height: 20),
-                  SignalBuilder(
-                    builder: (context) {
-                      final path = _pathSignal.value;
-                      return _SettingItem(
-                        title: 'Путь для сохранения треков',
-                        subtitle: path.value ?? 'По умолчанию (Загрузки)',
-                        icon: Icons.folder_open_rounded,
-                        onTap: () => unawaited(_pickPath()),
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 32),
-                  const _SectionTitle(title: 'Визуальные эффекты'),
-                  const SizedBox(height: 20),
-                  SignalBuilder(
-                    builder: (context) {
-                      final enabled = vibeVisibleSignal.value;
-                      return _SettingItem(
-                        title: 'Показывать волну',
-                        subtitle: 'Динамический фон, реагирующий на музыку',
-                        icon: Icons.waves_rounded,
-                        onTap: () => unawaited(
-                          _toggleVibeVisibility(!enabled),
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          name,
+                          style: GText.sm(weight: GText.medium),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        trailing: Switch(
-                          value: enabled,
-                          onChanged: (value) => unawaited(
-                            _toggleVibeVisibility(value),
-                          ),
-                        ),
-                      );
-                    },
+                      ),
+                      if (account.hasPlus) ...[
+                        const SizedBox(width: 8),
+                        const GBadge('Плюс', brand: true),
+                      ],
+                      if (active) ...[
+                        const SizedBox(width: 6),
+                        const GBadge('Активен'),
+                      ],
+                    ],
                   ),
-                  const SizedBox(height: 8),
-                  SignalBuilder(
-                    builder: (context) {
-                      final scale = vibeRenderScaleSignal.value;
-                      return _SettingItem(
-                        title: 'Разрешение волны',
-                        subtitle:
-                            '${(scale * 100).round()}% — выше качество, выше нагрузка',
-                        icon: Icons.high_quality_rounded,
-                        onTap: () {},
-                        trailing: SizedBox(
-                          width: isNarrow ? 120 : 200,
-                          child: Slider(
-                            value: scale,
-                            min: minVibeRenderScale,
-                            max: maxVibeRenderScale,
-                            divisions: 5,
-                            label: '${(scale * 100).round()}%',
-                            onChanged: vibeVisibleSignal.value
-                                ? (value) {
-                                    vibeRenderScaleSignal.value = value;
-                                  }
-                                : null,
-                            onChangeEnd: (value) => unawaited(
-                              _saveVibeRenderScale(value),
+                  const SizedBox(height: 2),
+                  Text.rich(
+                    TextSpan(
+                      children: [
+                        TextSpan(text: subtitle),
+                        if (account.needsLogin) ...[
+                          const TextSpan(text: ' · '),
+                          TextSpan(
+                            text: 'Требуется вход',
+                            style: GText.xs(
+                              weight: GText.medium,
+                              color: GColors.destructive,
                             ),
                           ),
-                        ),
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 8),
-                  SignalBuilder(
-                    builder: (context) {
-                      final enabled = blurEffectsEnabledSignal.value;
-                      return _SettingItem(
-                        title: 'Размытие интерфейса',
-                        subtitle: 'Размывать фон под панелями управления',
-                        icon: Icons.blur_on_rounded,
-                        onTap: () => unawaited(
-                          _toggleBlurEffects(!enabled),
-                        ),
-                        trailing: Switch(
-                          value: enabled,
-                          onChanged: (value) => unawaited(
-                            _toggleBlurEffects(value),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                  if (context.isDesktop) ...[
-                    const SizedBox(height: 32),
-                    const _SectionTitle(title: 'Горячие клавиши'),
-                    const SizedBox(height: 20),
-                    _SettingItem(
-                      title: 'Управление горячими клавишами',
-                      subtitle:
-                          'Глобальные сочетания клавиш, работающие вне окна',
-                      icon: Icons.keyboard_command_key_rounded,
-                      onTap: () => unawaited(
-                        showDialog<void>(
-                          context: context,
-                          builder: (context) => const _GlobalHotkeysDialog(),
-                        ),
-                      ),
-                    ),
-                  ],
-                  if (context.isDesktop) ...[
-                    const SizedBox(height: 32),
-                    const _SectionTitle(title: 'Внешний вид'),
-                    const SizedBox(height: 20),
-                    SignalBuilder(
-                      builder: (context) {
-                        final enabled = _customTitlebarSignal.value;
-                        return _SettingItem(
-                          title: 'Собственная рамка окна',
-                          subtitle: 'Отключает стандартную рамку ОС',
-                          icon: Icons.web_asset_rounded,
-                          onTap: () => unawaited(
-                            _toggleCustomTitlebar(!(enabled.value ?? false)),
-                          ),
-                          trailing: Switch(
-                            value: enabled.value ?? false,
-                            onChanged: (v) =>
-                                unawaited(_toggleCustomTitlebar(v)),
-                          ),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    SignalBuilder(
-                      builder: (context) {
-                        final enabled = _autoHideNavbarSignal.value;
-                        return _SettingItem(
-                          title: 'Скрывать боковую панель',
-                          subtitle:
-                              'Автоматически скрывать навигацию на главном экране',
-                          icon: Icons.vertical_split_rounded,
-                          onTap: () => unawaited(
-                            _toggleAutoHideNavbar(!(enabled.value ?? false)),
-                          ),
-                          trailing: Switch(
-                            value: enabled.value ?? false,
-                            onChanged: (v) =>
-                                unawaited(_toggleAutoHideNavbar(v)),
-                          ),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 32),
-                  ],
-                  if (context.isDesktop) ...[
-                    const _SectionTitle(title: 'Интеграции'),
-                    const SizedBox(height: 20),
-                    SignalBuilder(
-                      builder: (context) {
-                        final enabled = _discordRpcSignal.value;
-                        return _SettingItem(
-                          title: 'Discord Rich Presence',
-                          subtitle: 'Показывать текущий трек в статусе Discord',
-                          icon: Icons.discord_rounded,
-                          onTap: () => unawaited(
-                            _toggleDiscordRpc(!(enabled.value ?? true)),
-                          ),
-                          trailing: Switch(
-                            value: enabled.value ?? true,
-                            onChanged: (v) => unawaited(_toggleDiscordRpc(v)),
-                          ),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 32),
-                  ],
-                  if (context.isDesktop) ...[
-                    const _SectionTitle(title: 'Система'),
-                    const SizedBox(height: 20),
-                    SignalBuilder(
-                      builder: (context) {
-                        final enabled = _closeToTraySignal.value;
-                        return _SettingItem(
-                          title: 'Сворачивать в трей при закрытии',
-                          subtitle:
-                              'При нажатии на крестик приложение будет скрыто в трей',
-                          icon: Icons.window_rounded,
-                          onTap: () => unawaited(
-                            _toggleCloseToTray(!(enabled.value ?? true)),
-                          ),
-                          trailing: Switch(
-                            value: enabled.value ?? true,
-                            onChanged: (v) => unawaited(_toggleCloseToTray(v)),
-                          ),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 32),
-                  ],
-                  const _SectionTitle(title: 'Тексты песен'),
-                  const SizedBox(height: 20),
-                  _SettingItem(
-                    title: 'Источники текста песен',
-                    subtitle:
-                        'Включённые источники для поиска синхронного текста, если у ',
-                    icon: Icons.lyrics_rounded,
-                    onTap: () => LyricsProvidersDialog.show(context),
-                  ),
-                  const SizedBox(height: 32),
-                  const _SectionTitle(title: 'Кэш'),
-                  const SizedBox(height: 20),
-                  SignalBuilder(
-                    builder: (context) {
-                      final size = _cacheSizeSignal.value;
-                      return _SettingItem(
-                        title: 'Очистить кэш изображений и данных',
-                        subtitle: size.map(
-                          data: (d) => 'Занято: ${_formatBytes(d)}',
-                          error: (e, s) => 'Ошибка при получении размера',
-                          loading: () => 'Подсчет...',
-                        ),
-                        icon: Icons.image_not_supported_rounded,
-                        onTap: () => unawaited(_clearCache()),
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 8),
-                  SignalBuilder(
-                    builder: (context) {
-                      final size = _trackCacheSizeSignal.value;
-                      return _SettingItem(
-                        title: 'Удалить скачанные треки',
-                        subtitle: size.map(
-                          data: (d) => 'Занято: ${_formatBytes(d)}',
-                          error: (e, s) => 'Ошибка при получении размера',
-                          loading: () => 'Подсчет...',
-                        ),
-                        icon: Icons.music_off_rounded,
-                        onTap: () => unawaited(_clearTrackCache()),
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 32),
-                  const _SectionTitle(title: 'О приложении'),
-                  const SizedBox(height: 20),
-                  Container(
-                    padding: EdgeInsets.all(isNarrow ? 18 : 24),
-                    decoration: BoxDecoration(
-                      color: cs.onSurface.withValues(alpha: 0.05),
-                      borderRadius: BorderRadius.circular(AppRadius.lg),
-                      border: Border.all(
-                        color: cs.onSurface.withValues(alpha: 0.1),
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'YouMuz',
-                          style: TextStyle(
-                            color: cs.onSurface,
-                            fontSize: isNarrow ? 18 : 20,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        SignalBuilder(
-                          builder: (context) {
-                            final version = _versionSignal.value;
-                            return Text(
-                              'Альтернативный клиент для Яндекс Музыки.\nВерсия ${version.value ?? '...'}',
-                              style: TextStyle(
-                                color: cs.onSurfaceVariant,
-                                fontSize: isNarrow ? 14 : 16,
-                              ),
-                            );
-                          },
-                        ),
+                        ],
                       ],
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  SignalBuilder(
-                    builder: (context) {
-                      final enabled = _updateCheckSignal.value;
-                      return _SettingItem(
-                        title: 'Проверка обновлений при запуске',
-                        subtitle:
-                            'Проверять наличие новых версий на GitHub при запуске',
-                        icon: Icons.system_update_rounded,
-                        onTap: () => unawaited(
-                          _toggleUpdateCheck(!(enabled.value ?? true)),
-                        ),
-                        trailing: Switch(
-                          value: enabled.value ?? true,
-                          onChanged: (v) => unawaited(_toggleUpdateCheck(v)),
-                        ),
-                      );
-                    },
+                    style: GText.xs(color: GColors.mutedForeground),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ],
               ),
             ),
-          ),
-          const SliverToBoxAdapter(child: SizedBox(height: 60)),
-        ],
+            const SizedBox(width: 8),
+            if (pending)
+              const Padding(
+                padding: EdgeInsets.all(8),
+                child: SizedBox.square(
+                  dimension: 16,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: GColors.mutedForeground,
+                  ),
+                ),
+              )
+            else
+              GIconButton(
+                icon: LucideIcons.trash2,
+                tooltip: 'Выйти из аккаунта',
+                hoverColor: GColors.destructive,
+                onPressed: onRemove,
+              ),
+          ],
+        ),
       ),
     );
   }
 }
 
-class _GlobalHotkeysSettings extends StatefulWidget {
-  const _GlobalHotkeysSettings();
+// ---------------------------------------------------------------------------
+// Building blocks
+// ---------------------------------------------------------------------------
 
-  @override
-  State<_GlobalHotkeysSettings> createState() => _GlobalHotkeysSettingsState();
-}
+/// Section label above a card whose rows are separated by hairlines.
+class _SettingsSection extends StatelessWidget {
+  const _SettingsSection({
+    required this.label,
+    required this.children,
+    this.note,
+  });
 
-class _GlobalHotkeysSettingsState extends State<_GlobalHotkeysSettings> {
-  @override
-  void initState() {
-    super.initState();
-    // Подтянуть свежее состояние из Rust при каждом открытии настроек.
-    unawaited(GlobalHotkeyService.refresh());
-  }
-
-  Future<void> _edit(GlobalHotkeyBinding binding) async {
-    final combo = await showDialog<RecordedHotkey>(
-      context: context,
-      builder: (context) => _HotkeyDialog(binding: binding),
-    );
-    if (!mounted || combo == null) return;
-
-    final error = await GlobalHotkeyService.updateBinding(binding.action, combo);
-    if (!mounted || error == null) return;
-    showAppError(error);
-  }
+  final String label;
+  final List<Widget> children;
+  final String? note;
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final isNarrow = context.isNarrow;
-
-    return ValueListenableBuilder<int>(
-      valueListenable: GlobalHotkeyService.changes,
-      builder: (context, _, child) {
-        final bindings = GlobalHotkeyService.bindings;
-        return Container(
-          decoration: BoxDecoration(
-            color: cs.onSurface.withValues(alpha: 0.04),
-            borderRadius: BorderRadius.circular(AppRadius.md),
-            border: Border.all(color: cs.onSurface.withValues(alpha: 0.1)),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 12),
+          child: Semantics(
+            header: true,
+            child: Text(label, style: GText.sm(weight: GText.medium)),
           ),
-          child: Column(
-            children: [
-              _HotkeyMasterRow(
-                enabled: GlobalHotkeyService.hotkeysEnabled,
-                onChanged: (enabled) => unawaited(
-                  GlobalHotkeyService.setAllEnabled(enabled: enabled),
-                ),
-              ),
-              Divider(
-                height: 1,
-                indent: isNarrow ? 16 : 20,
-                endIndent: isNarrow ? 16 : 20,
-              ),
-              for (var i = 0; i < bindings.length; i++) ...[
-                _HotkeySettingRow(
-                  binding: bindings[i],
-                  hotkeysEnabled: GlobalHotkeyService.hotkeysEnabled,
-                  onEnabledChanged: (enabled) => unawaited(
-                    GlobalHotkeyService.setEnabled(
-                      bindings[i].action,
-                      enabled: enabled,
-                    ),
-                  ),
-                  onEdit: () => unawaited(_edit(bindings[i])),
-                ),
-                if (i < bindings.length - 1)
-                  Divider(
-                    height: 1,
-                    indent: isNarrow ? 16 : 20,
-                    endIndent: isNarrow ? 16 : 20,
-                  ),
+        ),
+        GCard(
+          padding: EdgeInsets.zero,
+          child: ClipRRect(
+            // Keeps row hover fills inside the rounded corners.
+            borderRadius: BorderRadius.circular(GRadius.x2l),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (var i = 0; i < children.length; i++) ...[
+                  if (i > 0) const GDivider(),
+                  children[i],
+                ],
               ],
-            ],
+            ),
           ),
-        );
-      },
+        ),
+        if (note != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 10, 4, 0),
+            child: Text(note!, style: GText.xs(color: GColors.mutedForeground)),
+          ),
+      ],
     );
   }
 }
+
+/// Title and optional description on the left, a control on the right.
+/// With [onTap] the whole row is pressable and hovers to `secondary`.
+class _SettingsRow extends StatelessWidget {
+  const _SettingsRow({
+    required this.title,
+    this.description,
+    this.leading,
+    this.trailing,
+    this.onTap,
+  });
+
+  final String title;
+  final String? description;
+  final Widget? leading;
+  final Widget? trailing;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final content = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(
+        children: [
+          if (leading != null) ...[leading!, const SizedBox(width: 12)],
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(title, style: GText.sm(weight: GText.medium)),
+                if (description != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    description!,
+                    style: GText.xs(color: GColors.mutedForeground),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (trailing != null) ...[const SizedBox(width: 16), trailing!],
+        ],
+      ),
+    );
+    if (onTap == null) return content;
+    return GPressable(
+      onTap: onTap,
+      builder: (context, s) => AnimatedContainer(
+        duration: GDurations.fast,
+        curve: GCurves.standard,
+        color: s.highlighted ? GColors.secondary : const Color(0x00000000),
+        foregroundDecoration: s.focused ? _focusRing : null,
+        child: content,
+      ),
+    );
+  }
+}
+
+/// Row toggled by a click anywhere on it, or Space/Enter while focused.
+class _SwitchRow extends StatelessWidget {
+  const _SwitchRow({
+    required this.title,
+    required this.value,
+    required this.onChanged,
+    this.description,
+    this.enabled = true,
+  });
+
+  final String title;
+  final String? description;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    return _SettingsRow(
+      title: title,
+      description: description,
+      onTap: enabled ? () => onChanged(!value) : null,
+      // The row is the single focus target (GPressable only reports hover
+      // while focusable), so the switch stays out of the tab order.
+      trailing: ExcludeFocus(
+        child: Switch(value: value, onChanged: enabled ? onChanged : null),
+      ),
+    );
+  }
+}
+
+/// App mark from the header: a foreground disc with a background dot.
+class _AppMark extends StatelessWidget {
+  const _AppMark();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 36,
+      height: 36,
+      alignment: Alignment.center,
+      decoration: const BoxDecoration(
+        color: GColors.foreground,
+        shape: BoxShape.circle,
+      ),
+      child: Container(
+        width: 12,
+        height: 12,
+        decoration: const BoxDecoration(
+          color: GColors.background,
+          shape: BoxShape.circle,
+        ),
+      ),
+    );
+  }
+}
+
+/// Hairline-bordered group for rows inside a dialog (the dialog itself is
+/// already `bg-card`).
+class _OutlinedGroup extends StatelessWidget {
+  const _OutlinedGroup({required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(GRadius.xl),
+        border: Border.all(color: GColors.border),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(GRadius.xl - 1),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (var i = 0; i < children.length; i++) ...[
+              if (i > 0) const GDivider(),
+              children[i],
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Global hotkeys
+// ---------------------------------------------------------------------------
 
 class _GlobalHotkeysDialog extends StatefulWidget {
   const _GlobalHotkeysDialog();
@@ -623,41 +925,99 @@ class _GlobalHotkeysDialog extends StatefulWidget {
 }
 
 class _GlobalHotkeysDialogState extends State<_GlobalHotkeysDialog> {
+  bool _resetting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Fresh state from Rust every time the dialog opens.
+    unawaited(GlobalHotkeyService.refresh());
+  }
+
   Future<void> _reset() async {
+    setState(() => _resetting = true);
     await GlobalHotkeyService.resetDefaults();
-    if (mounted) showAppSuccess('Горячие клавиши сброшены по умолчанию');
+    if (!mounted) return;
+    setState(() => _resetting = false);
+    showAppSuccess('Горячие клавиши сброшены по умолчанию');
+  }
+
+  Future<void> _edit(GlobalHotkeyBinding binding) async {
+    final combo = await showGDialog<RecordedHotkey>(
+      context,
+      builder: (context) => _HotkeyDialog(binding: binding),
+    );
+    if (!mounted || combo == null) return;
+
+    final error = await GlobalHotkeyService.updateBinding(
+      binding.action,
+      combo,
+    );
+    if (!mounted || error == null) return;
+    showAppError(error);
   }
 
   @override
   Widget build(BuildContext context) {
-    final screenHeight = MediaQuery.sizeOf(context).height;
-    final maxContentHeight = (screenHeight * 0.82).clamp(360.0, 760.0);
-
-    return AppDialog(
+    return GDialog(
       title: 'Горячие клавиши',
-      content: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: 560,
-          maxHeight: maxContentHeight,
-        ),
-        child: const SingleChildScrollView(
-          child: _GlobalHotkeysSettings(),
+      description:
+          'Глобальные сочетания работают, даже когда окно свёрнуто или '
+          'неактивно.',
+      width: 560,
+      content: SingleChildScrollView(
+        child: ValueListenableBuilder<int>(
+          valueListenable: GlobalHotkeyService.changes,
+          builder: (context, _, _) {
+            final bindings = GlobalHotkeyService.bindings;
+            final hotkeysEnabled = GlobalHotkeyService.hotkeysEnabled;
+            return _OutlinedGroup(
+              children: [
+                _SwitchRow(
+                  title: 'Использовать горячие клавиши',
+                  description: hotkeysEnabled
+                      ? 'Все включённые сочетания активны в системе'
+                      : 'Все системные сочетания временно отключены',
+                  value: hotkeysEnabled,
+                  onChanged: (enabled) => unawaited(
+                    GlobalHotkeyService.setAllEnabled(enabled: enabled),
+                  ),
+                ),
+                for (final binding in bindings)
+                  _HotkeyBindingRow(
+                    binding: binding,
+                    hotkeysEnabled: hotkeysEnabled,
+                    onEnabledChanged: (enabled) => unawaited(
+                      GlobalHotkeyService.setEnabled(
+                        binding.action,
+                        enabled: enabled,
+                      ),
+                    ),
+                    onEdit: () => unawaited(_edit(binding)),
+                  ),
+              ],
+            );
+          },
         ),
       ),
       actions: [
         SizedBox(
           width: double.infinity,
           child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              TextButton.icon(
-                onPressed: () => unawaited(_reset()),
-                icon: const Icon(Icons.restore_rounded, size: 18),
-                label: const Text('Сбросить по умолчанию'),
+              Flexible(
+                child: GButton(
+                  label: 'Сбросить по умолчанию',
+                  icon: LucideIcons.rotateCcw,
+                  variant: GButtonVariant.ghost,
+                  loading: _resetting,
+                  onPressed: () => unawaited(_reset()),
+                ),
               ),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Закрыть'),
+              const Spacer(),
+              GButton(
+                label: 'Готово',
+                onPressed: () => Navigator.of(context).pop(),
               ),
             ],
           ),
@@ -667,133 +1027,42 @@ class _GlobalHotkeysDialogState extends State<_GlobalHotkeysDialog> {
   }
 }
 
-class _HotkeyMasterRow extends StatelessWidget {
-  final bool enabled;
-  final ValueChanged<bool> onChanged;
-
-  const _HotkeyMasterRow({required this.enabled, required this.onChanged});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final isNarrow = context.isNarrow;
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        horizontal: isNarrow ? 12 : 16,
-        vertical: isNarrow ? 10 : 12,
-      ),
-      child: Row(
-        children: [
-          Icon(
-            enabled ? Icons.keyboard_command_key_rounded : Icons.block_rounded,
-            color: enabled ? cs.primary : cs.onSurfaceVariant,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Использовать горячие клавиши',
-                  style: TextStyle(
-                    color: cs.onSurface,
-                    fontSize: isNarrow ? 14 : 15,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  enabled
-                      ? 'Все включённые сочетания активны в системе'
-                      : 'Все системные сочетания временно отключены',
-                  style: TextStyle(
-                    color: cs.onSurfaceVariant,
-                    fontSize: isNarrow ? 12 : 13,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Switch(value: enabled, onChanged: onChanged),
-        ],
-      ),
-    );
-  }
-}
-
-class _HotkeySettingRow extends StatelessWidget {
-  final GlobalHotkeyBinding binding;
-  final bool hotkeysEnabled;
-  final ValueChanged<bool> onEnabledChanged;
-  final VoidCallback onEdit;
-
-  const _HotkeySettingRow({
+class _HotkeyBindingRow extends StatelessWidget {
+  const _HotkeyBindingRow({
     required this.binding,
     required this.hotkeysEnabled,
     required this.onEnabledChanged,
     required this.onEdit,
   });
 
+  final GlobalHotkeyBinding binding;
+  final bool hotkeysEnabled;
+  final ValueChanged<bool> onEnabledChanged;
+  final VoidCallback onEdit;
+
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final isNarrow = context.isNarrow;
+    final active = binding.enabled && hotkeysEnabled;
     return Padding(
-      padding: EdgeInsets.symmetric(
-        horizontal: isNarrow ? 12 : 16,
-        vertical: isNarrow ? 8 : 10,
-      ),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
       child: Row(
         children: [
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  binding.action.title,
-                  style: TextStyle(
-                    color: binding.enabled && hotkeysEnabled
-                        ? cs.onSurface
-                        : cs.onSurfaceVariant,
-                    fontSize: isNarrow ? 14 : 15,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                InkWell(
-                  onTap: onEdit,
-                  borderRadius: BorderRadius.circular(AppRadius.xs),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: binding.enabled && hotkeysEnabled
-                          ? cs.primary.withValues(alpha: 0.12)
-                          : cs.onSurface.withValues(alpha: 0.06),
-                      borderRadius: BorderRadius.circular(AppRadius.xs),
-                    ),
-                    child: Text(
-                      binding.formattedCombo,
-                      style: TextStyle(
-                        color: binding.enabled && hotkeysEnabled
-                            ? cs.primary
-                            : cs.onSurfaceVariant,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+            child: Text(
+              binding.action.title,
+              style: GText.sm(
+                weight: GText.medium,
+                color: active ? GColors.foreground : GColors.mutedForeground,
+              ),
             ),
           ),
-          IconButton(
-            tooltip: 'Изменить сочетание',
+          const SizedBox(width: 12),
+          _KeyComboChip(
+            label: binding.formattedCombo,
+            active: active,
             onPressed: onEdit,
-            icon: const Icon(Icons.edit_rounded),
           ),
+          const SizedBox(width: 12),
           Switch(value: binding.enabled, onChanged: onEnabledChanged),
         ],
       ),
@@ -801,10 +1070,67 @@ class _HotkeySettingRow extends StatelessWidget {
   }
 }
 
-class _HotkeyDialog extends StatefulWidget {
-  final GlobalHotkeyBinding binding;
+/// Current combo in a key cap; clicking it records a new one.
+class _KeyComboChip extends StatelessWidget {
+  const _KeyComboChip({
+    required this.label,
+    required this.active,
+    required this.onPressed,
+  });
 
+  final String label;
+  final bool active;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return GPressable(
+      onTap: onPressed,
+      tooltip: 'Изменить сочетание',
+      semanticLabel: 'Сочетание $label, изменить',
+      builder: (context, s) {
+        final iconColor = s.highlighted
+            ? GColors.foreground
+            : GColors.mutedForeground;
+        return AnimatedContainer(
+          duration: GDurations.fast,
+          curve: GCurves.standard,
+          height: 28,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            color: s.hovered ? GColors.accent : GColors.secondary,
+            borderRadius: BorderRadius.circular(GRadius.md),
+            border: Border.all(
+              color: s.focused ? GColors.ring : GColors.border,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: GText.style(
+                  12,
+                  lineHeight: 16,
+                  weight: GText.medium,
+                  mono: true,
+                  color: active ? GColors.foreground : GColors.mutedForeground,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(LucideIcons.pencil, size: 12, color: iconColor),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _HotkeyDialog extends StatefulWidget {
   const _HotkeyDialog({required this.binding});
+
+  final GlobalHotkeyBinding binding;
 
   @override
   State<_HotkeyDialog> createState() => _HotkeyDialogState();
@@ -822,31 +1148,23 @@ class _HotkeyDialogState extends State<_HotkeyDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return AppDialog(
+    return GDialog(
       title: widget.binding.action.title,
-      content: SizedBox(
-        width: 420,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Нажмите нужное сочетание клавиш'),
-            const SizedBox(height: 20),
-            Center(
-              child: _HotkeyRecorder(
-                initial: _combo,
-                onRecorded: (combo) => setState(() => _combo = combo),
-              ),
-            ),
-          ],
+      description: 'Нажмите нужное сочетание клавиш',
+      width: 420,
+      content: Center(
+        child: _HotkeyRecorder(
+          initial: _combo,
+          onRecorded: (combo) => setState(() => _combo = combo),
         ),
       ),
       actions: [
-        AppDialog.cancelButton(context),
-        FilledButton(
-          onPressed: _combo == null ? null : _save,
-          child: const Text('Сохранить'),
+        GButton(
+          label: 'Отмена',
+          variant: GButtonVariant.secondary,
+          onPressed: () => Navigator.pop(context),
         ),
+        GButton(label: 'Сохранить', onPressed: _combo == null ? null : _save),
       ],
     );
   }
@@ -856,10 +1174,10 @@ class _HotkeyDialogState extends State<_HotkeyDialog> {
 /// the field is focused, showing the pending combo live. Replaces the
 /// `HotKeyRecorder` widget from the removed `hotkey_manager` plugin.
 class _HotkeyRecorder extends StatefulWidget {
+  const _HotkeyRecorder({required this.initial, required this.onRecorded});
+
   final RecordedHotkey? initial;
   final ValueChanged<RecordedHotkey> onRecorded;
-
-  const _HotkeyRecorder({required this.initial, required this.onRecorded});
 
   @override
   State<_HotkeyRecorder> createState() => _HotkeyRecorderState();
@@ -869,6 +1187,9 @@ class _HotkeyRecorderState extends State<_HotkeyRecorder> {
   final _focusNode = FocusNode();
   bool _focused = false;
   RecordedHotkey? _combo;
+
+  /// Modifiers held so far, before a real key completes the combo.
+  RecordedHotkey? _pending;
 
   @override
   void initState() {
@@ -883,9 +1204,21 @@ class _HotkeyRecorderState extends State<_HotkeyRecorder> {
   }
 
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
+    final hardware = HardwareKeyboard.instance;
+
+    if (event is KeyUpEvent) {
+      // Releasing every modifier without a key drops the live preview.
+      if (_pending != null &&
+          !hardware.isControlPressed &&
+          !hardware.isAltPressed &&
+          !hardware.isShiftPressed &&
+          !hardware.isMetaPressed) {
+        setState(() => _pending = null);
+      }
+      return KeyEventResult.handled;
+    }
     if (event is! KeyDownEvent) return KeyEventResult.handled;
 
-    final hardware = HardwareKeyboard.instance;
     final combo = RecordedHotkey(
       usbHidUsage: event.physicalKey.usbHidUsage,
       ctrl: hardware.isControlPressed,
@@ -896,18 +1229,17 @@ class _HotkeyRecorderState extends State<_HotkeyRecorder> {
 
     if (_isModifierKey(event.logicalKey)) {
       // Show the held modifiers live, but wait for a real key to record.
-      setState(() {});
-      _pending = combo;
+      setState(() => _pending = combo);
       return KeyEventResult.handled;
     }
 
-    setState(() => _combo = combo);
-    _pending = null;
+    setState(() {
+      _combo = combo;
+      _pending = null;
+    });
     widget.onRecorded(combo);
     return KeyEventResult.handled;
   }
-
-  RecordedHotkey? _pending;
 
   bool _isModifierKey(LogicalKeyboardKey key) {
     return key == LogicalKeyboardKey.controlLeft ||
@@ -920,50 +1252,14 @@ class _HotkeyRecorderState extends State<_HotkeyRecorder> {
         key == LogicalKeyboardKey.metaRight;
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final shown = _pending ?? _combo;
-
-    return Focus(
-      focusNode: _focusNode,
-      autofocus: true,
-      onKeyEvent: _onKeyEvent,
-      onFocusChange: (focused) => setState(() => _focused = focused),
-      child: InkWell(
-        onTap: _focusNode.requestFocus,
-        borderRadius: BorderRadius.circular(AppRadius.sm),
-        child: Container(
-          width: 240,
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(
-            color: _focused
-                ? cs.primary.withValues(alpha: 0.12)
-                : cs.onSurface.withValues(alpha: 0.06),
-            borderRadius: BorderRadius.circular(AppRadius.sm),
-            border: Border.all(
-              color: _focused ? cs.primary : cs.onSurface.withValues(alpha: 0.2),
-            ),
-          ),
-          child: Text(
-            shown == null
-                ? 'Нажмите сочетание...'
-                : [
-                    if (shown.ctrl) 'Ctrl',
-                    if (shown.alt) 'Alt',
-                    if (shown.shift) 'Shift',
-                    if (shown.meta) 'Win',
-                    _keyLabel(shown.usbHidUsage),
-                  ].join(' + '),
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: _focused ? cs.primary : cs.onSurface,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-      ),
-    );
+  String _label(RecordedHotkey shown) {
+    return [
+      if (shown.ctrl) 'Ctrl',
+      if (shown.alt) 'Alt',
+      if (shown.shift) 'Shift',
+      if (shown.meta) 'Win',
+      if (identical(shown, _pending)) '…' else _keyLabel(shown.usbHidUsage),
+    ].join(' + ');
   }
 
   String _keyLabel(int usage) {
@@ -979,102 +1275,72 @@ class _HotkeyRecorderState extends State<_HotkeyRecorder> {
     };
     return known[usage] ?? String.fromCharCode(usage & 0xFF).toUpperCase();
   }
-}
-
-class _SectionTitle extends StatelessWidget {
-  final String title;
-
-  const _SectionTitle({required this.title});
 
   @override
   Widget build(BuildContext context) {
-    final isNarrow = context.isNarrow;
-    return Text(
-      title,
-      style: TextStyle(
-        color: Theme.of(context).colorScheme.primary,
-        fontSize: isNarrow ? 20 : 24,
-        fontWeight: FontWeight.w800,
-      ),
-    );
-  }
-}
+    final shown = _pending ?? _combo;
 
-class _SettingItem extends StatelessWidget {
-  final String title;
-  final String subtitle;
-  final IconData icon;
-  final VoidCallback onTap;
-  final Widget? trailing;
-
-  const _SettingItem({
-    required this.title,
-    required this.subtitle,
-    required this.icon,
-    required this.onTap,
-    this.trailing,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final primaryColor = Theme.of(context).colorScheme.primary;
-    final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
-    final onSurface = Theme.of(context).colorScheme.onSurface;
-    final isNarrow = context.isNarrow;
-    return InkWell(
-      onTap: onTap,
-      onHover: (_) {},
-      hoverColor: onSurface.withValues(alpha: 0.06),
-      borderRadius: BorderRadius.circular(AppRadius.sm),
-      child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: isNarrow ? 8 : 12,
-          vertical: isNarrow ? 8 : 10,
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: EdgeInsets.all(isNarrow ? 8 : 10),
-              decoration: BoxDecoration(
-                color: primaryColor.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-              ),
-              child: Icon(icon, color: primaryColor, size: isNarrow ? 20 : 22),
-            ),
-            SizedBox(width: isNarrow ? 12 : 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: TextStyle(
-                      color: onSurface,
-                      fontSize: isNarrow ? 15 : 16,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    subtitle,
-                    style: TextStyle(
-                      color: onSurfaceVariant,
-                      fontSize: isNarrow ? 12 : 14,
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
+    return Focus(
+      focusNode: _focusNode,
+      autofocus: true,
+      onKeyEvent: _onKeyEvent,
+      onFocusChange: (focused) => setState(() => _focused = focused),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: _focusNode.requestFocus,
+          child: AnimatedContainer(
+            duration: GDurations.fast,
+            curve: GCurves.standard,
+            width: 280,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+            decoration: BoxDecoration(
+              color: GColors.secondary,
+              borderRadius: BorderRadius.circular(GRadius.xl),
+              border: Border.all(
+                color: _focused ? GColors.ring : GColors.border,
               ),
             ),
-            SizedBox(width: isNarrow ? 8 : 12),
-            trailing ??
-                Icon(
-                  Icons.chevron_right_rounded,
-                  color: onSurfaceVariant,
-                  size: isNarrow ? 22 : 24,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  shown == null ? 'Нажмите сочетание...' : _label(shown),
+                  textAlign: TextAlign.center,
+                  style: shown == null
+                      ? GText.sm(color: GColors.mutedForeground)
+                      : GText.style(
+                          15,
+                          lineHeight: 22,
+                          weight: GText.medium,
+                          mono: true,
+                        ),
                 ),
-          ],
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    AnimatedContainer(
+                      duration: GDurations.fast,
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: _focused
+                            ? GColors.brand
+                            : GColors.mutedForeground,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      _focused ? 'Идёт запись' : 'Нажмите, чтобы записать',
+                      style: GText.xs(color: GColors.mutedForeground),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );

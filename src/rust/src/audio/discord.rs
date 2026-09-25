@@ -1,7 +1,7 @@
 use crate::audio::signals::AudioSignals;
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient, activity};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CLIENT_ID: &str = "1269826362399522849";
@@ -9,28 +9,23 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct DiscordManager;
 
-/// Cancellation flag for the poll thread.
-///
-/// `spawn_blocking` tasks cannot be aborted and the `JoinHandle` was being
-/// discarded, so the loop was unstoppable: it pinned a blocking-pool thread for
-/// the life of the process, and a second `AudioSystem::spawn` (the documented
-/// re-login path) opened a *second* IPC connection with the same `CLIENT_ID`,
-/// so both threads pushed presence updates.
-static SHUTDOWN: OnceLock<AtomicBool> = OnceLock::new();
+/// Stops one presence thread. Each session owns its own flag: with a shared
+/// global flag, a new session clearing it could revive the previous
+/// session's thread before that thread noticed the stop request.
+#[derive(Clone)]
+pub struct DiscordHandle(Arc<AtomicBool>);
 
-fn shutdown_flag() -> &'static AtomicBool {
-    SHUTDOWN.get_or_init(|| AtomicBool::new(false))
-}
-
-/// Ask the poll thread to exit. Safe to call more than once.
-pub fn shutdown() {
-    shutdown_flag().store(true, Ordering::SeqCst);
+impl DiscordHandle {
+    /// Ask the poll thread to clear the presence and exit. Idempotent.
+    pub fn shutdown(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl DiscordManager {
-    pub fn spawn(signals: AudioSignals) {
-        // A fresh AudioSystem gets a fresh thread; clear any stale flag.
-        shutdown_flag().store(false, Ordering::SeqCst);
+    pub fn spawn(signals: AudioSignals) -> DiscordHandle {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = DiscordHandle(stop.clone());
 
         tokio::task::spawn_blocking(move || {
             let mut client: Option<DiscordIpcClient> = None;
@@ -39,9 +34,9 @@ impl DiscordManager {
             let mut last_rpc_enabled = false;
             let mut last_connect_attempt = Instant::now() - RECONNECT_INTERVAL;
 
-            while !shutdown_flag().load(Ordering::SeqCst) {
+            while !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1000));
-                if shutdown_flag().load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) {
                     break;
                 }
                 let rpc_enabled = signals.discord_rpc.get();
@@ -127,7 +122,16 @@ impl DiscordManager {
                     }
                 }
             }
+
+            // The next session (possibly another account) must not inherit
+            // this session's "listening to" status.
+            if let Some(mut c) = client.take() {
+                let _ = c.clear_activity();
+                let _ = c.close();
+            }
         });
+
+        handle
     }
 }
 

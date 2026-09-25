@@ -6,7 +6,7 @@
 
 #define AppName "YouMuz"
 #define AppPublisher "DarkPlayOff"
-#define AppURL "https://github.com/DarkPlayOff/YouMuz"
+#define AppURL "https://github.com/nekitdda/YouMuz"
 #define AppExeName "youmuz.exe"
 ; Must match the AUMID passed to SetCurrentProcessExplicitAppUserModelID in
 ; src\rust\src\audio\smtc.rs. Windows resolves the name shown in the media

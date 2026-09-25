@@ -1,0 +1,195 @@
+name: CI
+
+# Tests, analysis and installable builds for every push. The Windows job
+# builds the Inno Setup installer and smoke-tests it: silent install, launch,
+# screenshot, silent uninstall.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  rust-tests:
+    needs: generate-bridge
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: System Init
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev clang lld
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src/rust -> src/rust/target"
+      - uses: actions/download-artifact@v4
+        with:
+          name: frb-bridge
+          path: ${{ runner.temp }}/frb-bridge
+      - run: tar -xzf "$RUNNER_TEMP/frb-bridge/frb-bridge.tar.gz" -C "$GITHUB_WORKSPACE"
+      - name: Test
+        working-directory: ./src/rust
+        run: cargo test --lib
+
+  flutter-analyze:
+    needs: generate-bridge
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: frb-bridge
+          path: ${{ runner.temp }}/frb-bridge
+      - run: tar -xzf "$RUNNER_TEMP/frb-bridge/frb-bridge.tar.gz" -C "$GITHUB_WORKSPACE"
+      - name: Analyze
+        working-directory: ./src
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+  build-linux:
+    needs: generate-bridge
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: System Init
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config libgtk-3-dev libsecret-1-dev libsoup-3.0-dev libwebkit2gtk-4.1-dev libasound2-dev libkeybinder-3.0-dev curl git unzip clang lld libclang-dev llvm-dev libayatana-appindicator3-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src/rust -> src/target"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: frb-bridge
+          path: ${{ runner.temp }}/frb-bridge
+      - run: tar -xzf "$RUNNER_TEMP/frb-bridge/frb-bridge.tar.gz" -C "$GITHUB_WORKSPACE"
+      - name: Build
+        working-directory: ./src
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter build linux --release
+      - name: Archive
+        run: |
+          VERSION=$(sed -n 's/^version:[[:space:]]*\([0-9.]*\).*/\1/p' src/pubspec.yaml)
+          tar -czf "youmuz-linux-x64-${VERSION}.tar.gz" -C src/build/linux/x64/release/bundle/ .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux_x64_release
+          path: youmuz-linux-*.tar.gz
+
+  build-windows:
+    needs: generate-bridge
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C linker=lld-link.exe
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src/rust -> src/target"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: frb-bridge
+          path: ${{ runner.temp }}/frb-bridge
+      - name: Extract Bridge
+        shell: bash
+        run: tar -xzf "$(cygpath -u "$RUNNER_TEMP")/frb-bridge/frb-bridge.tar.gz" -C "$(cygpath -u "$GITHUB_WORKSPACE")"
+      - name: Build
+        working-directory: ./src
+        shell: powershell
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter build windows --release
+      - name: Ensure Inno Setup
+        shell: powershell
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build Installer
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "packaging\windows\youmuz.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+          Get-ChildItem dist
+      - name: Smoke-test installer
+        shell: powershell
+        run: |
+          $setup = Get-ChildItem dist\youmuz-windows-setup-*.exe | Select-Object -First 1
+          $dir = "$env:RUNNER_TEMP\YouMuzInstall"
+          $setupArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=`"$dir`"", "/LOG=`"$env:RUNNER_TEMP\install.log`"")
+          $proc = Start-Process -FilePath $setup.FullName -ArgumentList $setupArgs -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\install.log"; throw "Setup exit code $($proc.ExitCode)" }
+          foreach ($f in @('youmuz.exe', 'flutter_windows.dll', 'unins000.exe')) {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "Missing $f after install" }
+          }
+          if (-not (Get-ChildItem -Path $dir -Recurse -Filter 'youmuz*.dll')) { throw 'Rust core DLL missing' }
+          $app = Start-Process -FilePath (Join-Path $dir 'youmuz.exe') -PassThru
+          Start-Sleep -Seconds 30
+          if ($app.HasExited) { throw "Installed app exited early with code $($app.ExitCode)" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          New-Item -ItemType Directory -Force -Path smoke | Out-Null
+          $bmp.Save("smoke\installed-app.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          "Process $($app.Id) running, working set $([math]::Round($app.WorkingSet64 / 1MB)) MB" | Tee-Object smoke\result.txt
+          Stop-Process -Id $app.Id -Force
+          Start-Sleep -Seconds 3
+          $un = Start-Process -FilePath (Join-Path $dir 'unins000.exe') -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($un.ExitCode -ne 0) { throw "Uninstall exit code $($un.ExitCode)" }
+          Start-Sleep -Seconds 3
+          if (Test-Path (Join-Path $dir 'youmuz.exe')) { throw 'Uninstaller left youmuz.exe behind' }
+          'Install / launch / uninstall OK' | Tee-Object -Append smoke\result.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows_smoke_test
+          path: smoke
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows_x64_installer
+          path: dist\youmuz-windows-setup-*.exe

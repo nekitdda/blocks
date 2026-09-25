@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:youmuz/src/features/core/theme/app_tokens.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
 import 'package:youmuz/src/features/settings/services/update_service.dart';
+import 'package:youmuz/src/ui/ui.dart';
+
+final _bulletPattern = RegExp(r'^[-*+]\s+');
 
 class UpdateDialog extends StatefulWidget {
   final AppUpdateInfo? initialInfo;
@@ -16,26 +16,20 @@ class UpdateDialog extends StatefulWidget {
 
   static void show(BuildContext context, {AppUpdateInfo? initialInfo}) {
     if (Platform.isAndroid) {
+      // Shape, drag handle and barrier come from the bottom sheet theme.
       unawaited(
         showModalBottomSheet<void>(
           context: context,
           isScrollControlled: true,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.vertical(
-              top: Radius.circular(AppRadius.xxl),
-            ),
-          ),
-          builder: (context) => UpdateDialog(
-            initialInfo: initialInfo,
-            bottomSheet: true,
-          ),
+          builder: (context) =>
+              UpdateDialog(initialInfo: initialInfo, bottomSheet: true),
         ),
       );
       return;
     }
     unawaited(
-      showDialog<void>(
-        context: context,
+      showGDialog<void>(
+        context,
         builder: (context) => UpdateDialog(initialInfo: initialInfo),
       ),
     );
@@ -56,111 +50,110 @@ class _UpdateDialogState extends State<UpdateDialog> {
     if (widget.initialInfo != null) {
       _info = widget.initialInfo;
     } else {
-      unawaited(_checkUpdates());
+      _isLoading = true;
+      unawaited(_fetchUpdateInfo());
     }
   }
 
-  Future<void> _checkUpdates() async {
+  void _checkUpdates() {
     setState(() {
       _isLoading = true;
       _error = null;
     });
+    unawaited(_fetchUpdateInfo());
+  }
 
+  Future<void> _fetchUpdateInfo() async {
     final info = await UpdateService.checkForUpdates();
-    if (mounted) {
-      setState(() {
-        _isLoading = false;
-        if (info == null) {
-          _error =
-              'Не удалось проверить обновления. Проверьте интернет-соединение.';
-        } else {
-          _info = info;
-        }
-      });
-    }
+    if (!mounted) return;
+    setState(() {
+      _isLoading = false;
+      if (info == null) {
+        _error = 'Проверьте интернет-соединение.';
+      } else {
+        _info = info;
+      }
+    });
   }
 
   void _launchUrl(String url) {
-    unawaited(
-      () async {
-        try {
-          final uri = Uri.parse(url);
-          if (await canLaunchUrl(uri)) {
-            await launchUrl(uri, mode: LaunchMode.externalApplication);
-          }
-        } on Object catch (e) {
-          debugPrint('Error launching browser: $e');
+    unawaited(() async {
+      try {
+        final uri = Uri.parse(url);
+        if (await canLaunchUrl(uri)) {
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
         }
-      }(),
-    );
+      } on Object catch (e) {
+        debugPrint('Error launching browser: $e');
+      }
+    }());
   }
 
-  Widget _buildChangelog(BuildContext context, String changelog) {
-    final cs = Theme.of(context).colorScheme;
-    final lines = changelog.split('\n');
+  /// Minimal Markdown: `#` headings, `-`/`*` bullets, `**` stripped.
+  Widget _buildChangelog(String changelog) {
     final children = <Widget>[];
 
-    for (final line in lines) {
-      var trimmed = line.trim();
+    for (final line in changelog.split('\n')) {
+      final trimmed = line.trim();
       if (trimmed.isEmpty) {
         children.add(const SizedBox(height: 8));
         continue;
       }
 
-      Widget lineWidget;
-
       if (trimmed.startsWith('#')) {
         final depth = trimmed.indexOf(RegExp('[^#]'));
-        final titleText = trimmed.substring(depth).trim();
-        double fontSize = 18;
-        if (depth == 1) fontSize = 20;
-        if (depth == 2) fontSize = 16;
-        if (depth >= 3) fontSize = 14;
-
-        lineWidget = Padding(
-          padding: const EdgeInsets.only(top: 12, bottom: 6),
-          child: Text(
-            titleText,
-            style: TextStyle(
-              color: cs.onSurface,
-              fontSize: fontSize,
-              fontWeight: FontWeight.bold,
+        if (depth == -1) continue;
+        final style = switch (depth) {
+          1 => GText.base(weight: GText.semibold),
+          2 => GText.sm(weight: GText.semibold),
+          _ => GText.sm(weight: GText.medium),
+        };
+        children.add(
+          Padding(
+            padding: EdgeInsets.only(top: children.isEmpty ? 0 : 12, bottom: 6),
+            child: Text(
+              trimmed.substring(depth).trim().replaceAll('**', ''),
+              style: style,
             ),
           ),
         );
-      } else if (trimmed.startsWith('-') || trimmed.startsWith('*')) {
-        var itemText = trimmed.substring(1).trim();
-        itemText = itemText.replaceAll('**', '');
-        lineWidget = Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '  •  ',
-                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 14),
-              ),
-              Expanded(
-                child: Text(
-                  itemText,
-                  style: TextStyle(color: cs.onSurfaceVariant, fontSize: 14),
+      } else if (_bulletPattern.hasMatch(trimmed)) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 16,
+                  child: Text(
+                    '•',
+                    style: GText.sm(color: GColors.mutedForeground),
+                  ),
                 ),
-              ),
-            ],
+                Expanded(
+                  child: Text(
+                    trimmed
+                        .replaceFirst(_bulletPattern, '')
+                        .replaceAll('**', ''),
+                    style: GText.sm(color: GColors.mutedForeground),
+                  ),
+                ),
+              ],
+            ),
           ),
         );
       } else {
-        trimmed = trimmed.replaceAll('**', '');
-        lineWidget = Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Text(
-            trimmed,
-            style: TextStyle(color: cs.onSurfaceVariant, fontSize: 14),
+        children.add(
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Text(
+              trimmed.replaceAll('**', ''),
+              style: GText.sm(color: GColors.mutedForeground),
+            ),
           ),
         );
       }
-
-      children.add(lineWidget);
     }
 
     return SelectionArea(
@@ -171,159 +164,92 @@ class _UpdateDialogState extends State<UpdateDialog> {
     );
   }
 
+  Widget _closeButton(String label, {bool primary = false}) {
+    return GButton(
+      label: label,
+      variant: primary ? GButtonVariant.primary : GButtonVariant.secondary,
+      onPressed: () => Navigator.pop(context),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final primaryColor = cs.primary;
-
+    final info = _info;
     Widget content;
     var actions = <Widget>[];
 
     if (_isLoading) {
-      content = const SizedBox(
-        height: 150,
-        child: Center(
-          child: M3ELoadingIndicator(),
-        ),
-      );
+      content = const _LoadingBlock();
     } else if (_error != null) {
-      content = Padding(
-        padding: const EdgeInsets.symmetric(vertical: AppSpacing.xl),
+      content = _StatusBlock(
+        icon: LucideIcons.circleAlert,
+        iconColor: GColors.destructive,
+        title: 'Не удалось проверить обновления',
+        message: _error,
+      );
+      actions = [
+        if (!widget.bottomSheet) _closeButton('Закрыть'),
+        GButton(
+          label: 'Повторить',
+          icon: LucideIcons.refreshCw,
+          onPressed: _checkUpdates,
+        ),
+      ];
+    } else if (info != null && info.hasUpdate) {
+      content = ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 400),
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Icon(
-              Icons.error_outline_rounded,
-              color: cs.error,
-              size: 48,
-            ),
-            const SizedBox(height: 16),
             Text(
-              _error!,
-              textAlign: TextAlign.center,
-              style: TextStyle(color: cs.onSurfaceVariant, fontSize: 16),
+              'Список изменений в этой версии:',
+              style: GText.xs(
+                weight: GText.medium,
+                color: GColors.mutedForeground,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: GColors.background,
+                  borderRadius: BorderRadius.circular(GRadius.xl),
+                  border: Border.all(color: GColors.border),
+                ),
+                child: SingleChildScrollView(
+                  child: _buildChangelog(info.changelog),
+                ),
+              ),
             ),
           ],
         ),
       );
       actions = [
-        TextButton(
-          onPressed: () => unawaited(_checkUpdates()),
-          child: Text('Повторить', style: TextStyle(color: primaryColor)),
+        if (!widget.bottomSheet) _closeButton('Закрыть'),
+        GButton(
+          label: 'Скачать обновление',
+          icon: LucideIcons.download,
+          onPressed: () => _launchUrl(info.url),
         ),
-        if (!widget.bottomSheet)
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              'Закрыть',
-              style: TextStyle(color: cs.onSurfaceVariant),
-            ),
-          ),
       ];
-    } else if (_info != null) {
-      final info = _info!;
-      if (info.hasUpdate) {
-        content = ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 400),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Список изменений в этой версии:',
-                style: TextStyle(
-                  color: cs.onSurfaceVariant,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Expanded(
-                child: Container(
-                  width: double.maxFinite,
-                  padding: const EdgeInsets.all(AppSpacing.md),
-                  decoration: BoxDecoration(
-                    color: cs.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(AppRadius.sm),
-                    border: Border.all(
-                      color: cs.onSurface.withValues(alpha: 0.1),
-                    ),
-                  ),
-                  child: SingleChildScrollView(
-                    child: _buildChangelog(context, info.changelog),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        );
-        actions = [
-          ElevatedButton(
-            onPressed: () => _launchUrl(info.url),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: primaryColor,
-              foregroundColor: Colors.black,
-            ),
-            child: const Text(
-              'Скачать обновление',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-          ),
-          if (!widget.bottomSheet)
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text(
-                'Закрыть',
-                style: TextStyle(color: cs.onSurfaceVariant),
-              ),
-            ),
-        ];
-      } else {
-        content = Padding(
-          padding: const EdgeInsets.symmetric(vertical: AppSpacing.xl),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.check_circle_outline_rounded,
-                color: cs.tertiary,
-                size: 48,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'У вас установлена последняя версия',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: cs.onSurface,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Текущая версия: ${info.latestVersion}',
-                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 14),
-              ),
-            ],
-          ),
-        );
-        actions = [
-          if (!widget.bottomSheet)
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text(
-                'Отлично',
-                style: TextStyle(color: cs.onSurfaceVariant),
-              ),
-            ),
-        ];
-      }
+    } else if (info != null) {
+      content = _StatusBlock(
+        icon: LucideIcons.circleCheck,
+        iconColor: GColors.brand,
+        title: 'У вас установлена последняя версия',
+        message: 'Текущая версия: ${info.latestVersion}',
+      );
+      actions = [
+        if (!widget.bottomSheet) _closeButton('Отлично', primary: true),
+      ];
     } else {
       content = const SizedBox.shrink();
     }
 
-    final titleText = (_info != null && _info!.hasUpdate)
-        ? 'Доступно обновление до версии ${_info!.latestVersion}'
+    final titleText = info != null && info.hasUpdate
+        ? 'Доступно обновление до версии ${info.latestVersion}'
         : 'Обновление программы';
 
     if (widget.bottomSheet) {
@@ -332,82 +258,115 @@ class _UpdateDialogState extends State<UpdateDialog> {
           padding: EdgeInsets.only(
             bottom: MediaQuery.viewInsetsOf(context).bottom,
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(height: 12),
-              Center(
-                child: Container(
-                  width: 32,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: cs.onSurface.withValues(alpha: 0.24),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.lg,
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.system_update_rounded, color: cs.onSurface),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        titleText,
-                        style: TextStyle(
-                          color: cs.onSurface,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 18,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              Flexible(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: AppSpacing.lg,
-                  ),
-                  child: content,
-                ),
-              ),
-              if (actions.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(
-                    AppSpacing.lg,
-                    8,
-                    AppSpacing.lg,
-                    AppSpacing.lg,
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 4, 24, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(titleText, style: GText.lg(weight: GText.semibold)),
+                const SizedBox(height: 16),
+                Flexible(child: content),
+                if (actions.isNotEmpty) ...[
+                  const SizedBox(height: 24),
+                  Wrap(
+                    alignment: WrapAlignment.end,
+                    spacing: 8,
+                    runSpacing: 8,
                     children: actions,
                   ),
-                ),
-            ],
+                ],
+              ],
+            ),
           ),
         ),
       );
     }
 
-    return AppDialog(
+    return GDialog(
       title: titleText,
-      titleIcon: Icons.system_update_rounded,
-      titleStyle: TextStyle(
-        color: cs.onSurface,
-        fontWeight: FontWeight.bold,
-        fontSize: 18,
-      ),
-      contentWidth: 500,
+      width: 520,
       content: content,
       actions: actions,
+    );
+  }
+}
+
+class _LoadingBlock extends StatelessWidget {
+  const _LoadingBlock();
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 160,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox.square(
+            dimension: 20,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: GColors.mutedForeground,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Проверяем наличие обновлений…',
+            style: GText.xs(color: GColors.mutedForeground),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Result state: icon in a `bg-secondary` circle, title and hint.
+class _StatusBlock extends StatelessWidget {
+  const _StatusBlock({
+    required this.icon,
+    required this.iconColor,
+    required this.title,
+    this.message,
+  });
+
+  final IconData icon;
+  final Color iconColor;
+  final String title;
+  final String? message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(
+              color: GColors.secondary,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, size: 20, color: iconColor),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: GText.base(weight: GText.semibold),
+          ),
+          if (message != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              message!,
+              textAlign: TextAlign.center,
+              style: GText.sm(color: GColors.mutedForeground),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

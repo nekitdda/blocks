@@ -1,89 +1,51 @@
 import 'dart:async';
-import 'dart:io' show Platform;
 
 import 'package:file_picker/file_picker.dart';
-import 'package:m3e_core/m3e_core.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:youmuz/src/features/auth/providers/auth_provider.dart';
 import 'package:youmuz/src/features/core/providers/navigation_provider.dart';
 import 'package:youmuz/src/features/core/providers/notification_provider.dart';
-import 'package:youmuz/src/features/core/theme/app_tokens.dart';
-import 'package:youmuz/src/features/core/views/widgets/app_context_menu.dart';
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
-import 'package:youmuz/src/features/core/views/widgets/download_menu.dart';
-import 'package:youmuz/src/features/core/views/widgets/responsive.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_elements.dart';
-import 'package:youmuz/src/features/core/views/widgets/track_tile.dart';
+import 'package:youmuz/src/features/core/services/rust_bridge.dart';
+import 'package:youmuz/src/features/core/views/widgets/collection_page.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_actions.dart';
+import 'package:youmuz/src/features/core/views/widgets/track_row.dart';
 import 'package:youmuz/src/features/library/providers/library_provider.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
 import 'package:youmuz/src/rust/api/content.dart' as rust;
 import 'package:youmuz/src/rust/api/models.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
-/// Stable identity for the "no tracks" case, so `didUpdateWidget` in
-/// `_PlaylistContent` does not re-copy `_localTracks` on every rebuild.
-const List<SimpleTrackDto> _emptyTracks = [];
-
+/// Playlist page: cover, title, stats and actions next to the track list
+/// (search, reorder, remove and upload for the account's own playlists).
 class PlaylistView extends StatefulWidget {
+  const PlaylistView({super.key, this.uid, this.kind});
+
   final String? uid;
   final String? kind;
-  const PlaylistView({super.key, this.uid, this.kind});
 
   @override
   State<PlaylistView> createState() => _PlaylistViewState();
 }
 
 class _PlaylistViewState extends State<PlaylistView> {
-  late final FutureSignal<PlaylistDetailsDto?> _playlistAsync;
-  // Signal to store metadata (title), so it doesn't disappear during search
-  final FlutterSignal<PlaylistDetailsDto?> _playlistMetadata =
-      signal<PlaylistDetailsDto?>(null);
-  final FlutterSignal<String> _searchQuery = signal('');
+  PlaylistDetailsDto? _playlist;
+  List<SimpleTrackDto> _tracks = const [];
+  bool _loading = true;
+  String? _error;
   final _searchController = TextEditingController();
   Timer? _searchDebounce;
+  String _query = '';
+  int _request = 0;
+
+  int? get _uid => int.tryParse(widget.uid ?? '');
+  int? get _kind => int.tryParse(widget.kind ?? '');
 
   @override
   void initState() {
     super.initState();
-    final uStr = widget.uid;
-    final kStr = widget.kind;
-
-    _playlistAsync = futureSignal(() async {
-      if (uStr == null || kStr == null) return null;
-      final u = int.tryParse(uStr);
-      final k = int.tryParse(kStr);
-      if (u == null || k == null) return null;
-      final ctx = appContextSignal.value;
-      if (ctx == null) return null;
-
-      // The debounce lives in the WRITER below, not here. Delaying inside the
-      // future meant every keystroke started a new run with its own 300ms
-      // timer and the earlier ones were never cancelled, so typing "abc" fired
-      // three concurrent FFI calls.
-      final query = _searchQuery();
-
-      final result = await rust.getPlaylistDetails(
-        ctx: ctx,
-        uid: u,
-        kind: k,
-        query: query.isEmpty ? null : query,
-      );
-
-      // Store metadata if loading is successful
-      if (result != null && query.isEmpty) {
-        _playlistMetadata.value = result;
-      }
-
-      return result;
-    });
-
-    _searchController.addListener(() {
-      _searchDebounce?.cancel();
-      _searchDebounce = Timer(
-        const Duration(milliseconds: 300),
-        () => _searchQuery.value = _searchController.text,
-      );
-    });
+    unawaited(_load());
   }
 
   @override
@@ -93,569 +55,258 @@ class _PlaylistViewState extends State<PlaylistView> {
     super.dispose();
   }
 
+  Future<void> _load() async {
+    final uid = _uid;
+    final kind = _kind;
+    if (uid == null || kind == null) {
+      setState(() {
+        _loading = false;
+        _error = 'Плейлист не выбран';
+      });
+      return;
+    }
+    final request = ++_request;
+    setState(() => _loading = true);
+    final query = _query;
+    final result = await runRustFetch(
+      (ctx) => rust.getPlaylistDetails(ctx: ctx, uid: uid, kind: kind, query: query.isEmpty ? null : query),
+    );
+    if (!mounted || request != _request) return;
+    setState(() {
+      _loading = false;
+      if (result == null) {
+        _error ??= _playlist == null ? 'Плейлист не найден' : null;
+        return;
+      }
+      _error = null;
+      if (query.isEmpty) _playlist = result;
+      _playlist ??= result;
+      _tracks = result.tracks;
+    });
+  }
+
+  void _onSearch(String value) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+      _query = value.trim();
+      unawaited(_load());
+    });
+  }
+
+  bool get _owned => _playlist != null && _playlist!.uid == activeAccountUidSignal.value;
+
+  Future<void> _upload() async {
+    final files = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['mp3', 'flac']);
+    if (files.isEmpty || files.single.path == null) return;
+    showAppSuccess('Загрузка трека началась...');
+    final ok = await uploadTrackAction(files.single.path!, playlistKind: _playlist!.kind);
+    if (ok) {
+      showAppSuccess('Трек успешно загружен');
+      unawaited(_load());
+    } else {
+      showAppError('Ошибка при загрузке трека');
+    }
+  }
+
+  Future<void> _rename() async {
+    final p = _playlist!;
+    final title = await showGPrompt(context, title: 'Переименовать плейлист', initialValue: p.title);
+    if (title == null || title == p.title) return;
+    if (await renamePlaylistAction(p.kind, title)) {
+      unawaited(_load());
+    }
+  }
+
+  Future<void> _toggleVisibility() async {
+    final p = _playlist!;
+    if (await setPlaylistVisibilityAction(p.kind, isPublic: !p.isPublic)) {
+      showAppSuccess(p.isPublic ? 'Плейлист стал приватным' : 'Плейлист стал публичным');
+      unawaited(_load());
+    }
+  }
+
+  Future<void> _delete() async {
+    final p = _playlist!;
+    final ok = await showGConfirm(
+      context,
+      title: 'Удалить плейлист?',
+      message: '«${p.title}» будет удалён без возможности восстановления.',
+      confirmLabel: 'Удалить',
+      destructive: true,
+    );
+    if (!ok) return;
+    if (await deletePlaylistAction(p.kind)) {
+      showAppSuccess('Плейлист удалён');
+      goBack();
+    }
+  }
+
+  Future<void> _remove(SimpleTrackDto t) async {
+    if (await removeTrackFromPlaylistAction(_playlist!.kind, t.id, t.albumId)) {
+      showAppSuccess('Трек удалён из плейлиста');
+      unawaited(_load());
+    } else {
+      showAppError('Не удалось удалить трек');
+    }
+  }
+
+  Future<void> _move(int from, int to) async {
+    if (to < 0 || to >= _tracks.length) return;
+    final t = _tracks[from];
+    setState(() {
+      final list = [..._tracks];
+      list.insert(to, list.removeAt(from));
+      _tracks = list;
+    });
+    if (!await moveTrackInPlaylistAction(_playlist!.kind, from, to, t.id, t.albumId)) {
+      unawaited(_load());
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (widget.uid == null || widget.kind == null) {
-      return const Center(child: Text('Плейлист не выбран'));
+    final p = _playlist;
+    if (p == null) {
+      if (_loading) return const GLoader();
+      return GEmptyState(icon: LucideIcons.listMusic, title: _error ?? 'Плейлист не найден');
     }
+    final totalMs = _tracks.fold<int>(0, (a, t) => a + t.durationMs);
+    final owned = _owned;
+    final searching = _query.isNotEmpty;
 
     return SignalBuilder(
       builder: (context) {
-        final meta = _playlistMetadata.value;
-        final state = _playlistAsync.value;
-
-        // Show full loader only if we have NO data yet
-        if (meta == null && state.isLoading) {
-          return const Center(child: CommonLoadingWidget());
-        }
-
-        if (state.hasError && meta == null) {
-          return Center(
-            child: CommonErrorWidget(error: state.error.toString()),
-          );
-        }
-
-        if (meta == null) {
-          return const Center(child: Text('Плейлист не найден'));
-        }
-
-        return _PlaylistContent(
-          playlist: meta,
-          // A const empty list: `?? []` allocated a fresh list identity on
-          // every parent rebuild, so `didUpdateWidget`'s identity check saw a
-          // change each time and re-copied `_localTracks` for nothing.
-          tracks: state.value?.tracks ?? _emptyTracks,
-          isLoading: state.isLoading,
-          refresh: () => _playlistAsync.refresh(),
-          searchController: _searchController,
-        );
-      },
-    );
-  }
-}
-
-class _PlaylistContent extends StatefulWidget {
-  final PlaylistDetailsDto playlist;
-  final List<SimpleTrackDto> tracks;
-  final bool isLoading;
-  final VoidCallback refresh;
-  final TextEditingController searchController;
-
-  const _PlaylistContent({
-    required this.playlist,
-    required this.tracks,
-    required this.isLoading,
-    required this.refresh,
-    required this.searchController,
-  });
-
-  @override
-  State<_PlaylistContent> createState() => _PlaylistContentState();
-}
-
-class _PlaylistContentState extends State<_PlaylistContent> {
-  // List of tracks for local manipulations (reorder)
-  late List<SimpleTrackDto> _localTracks;
-  bool _isDownloading = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _localTracks = List.from(widget.tracks);
-  }
-
-  @override
-  void didUpdateWidget(_PlaylistContent oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // Update local list only when new data arrives
-    if (widget.tracks != oldWidget.tracks) {
-      _localTracks = List.from(widget.tracks);
-    }
-  }
-
-  Future<void> _handleUpload(BuildContext context) async {
-    final files = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['mp3', 'flac'],
-    );
-
-    if (files.isEmpty || files.single.path == null) return;
-
-    final filePath = files.single.path!;
-    if (context.mounted) {
-      showAppSuccess('Загрузка трека началась...');
-    }
-
-    final success = await uploadTrackAction(
-      filePath,
-      playlistKind: widget.playlist.kind,
-    );
-
-    if (context.mounted) {
-      if (success) {
-        showAppSuccess('Трек успешно загружен');
-        widget.refresh();
-      } else {
-        showAppError('Ошибка при загрузке трека');
-      }
-    }
-  }
-
-  Future<void> _downloadPlaylist(DownloadMode mode) async {
-    if (_isDownloading || widget.playlist.tracks.isEmpty) return;
-
-    setState(() => _isDownloading = true);
-    showAppSuccess(
-      mode == DownloadMode.cache
-          ? 'Скачивание плейлиста в кэш началось...'
-          : 'Скачивание плейлиста в файлы началось...',
-    );
-
-    try {
-      if (mode == DownloadMode.cache) {
-        final ctx = appContextSignal.value;
-        if (ctx == null) return;
-        final trackIds = widget.playlist.tracks
-            .where((track) => !downloadedTracksSignal.value.contains(track.id))
-            .map((track) => track.id)
-            .toList();
-        if (trackIds.isNotEmpty) {
-          await rust.downloadTracks(
-            ctx: ctx,
-            trackIds: trackIds,
-            toCache: true,
-          );
-          unawaited(refreshDownloadedTracks());
-        }
-        if (!mounted) return;
-        showAppSuccess('Плейлист сохранён в кэш');
-      } else {
-        final paths = await downloadCollectionToFilesAction(
-          widget.playlist.tracks,
-          collectionName: 'Плейлист - ${widget.playlist.title}',
-        );
-
-        if (!mounted) return;
-        showAppSuccess('Сохранено файлов: ${paths.length}');
-      }
-    } on Object catch (e) {
-      if (!mounted) return;
-      showAppError('Ошибка при скачивании плейлиста: $e');
-    } finally {
-      if (mounted) setState(() => _isDownloading = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final searchActive = widget.searchController.text.isNotEmpty;
-    final isAndroid = Platform.isAndroid;
-
-    return CommonDetailSliverLayout(
-      header: CommonDetailHeader(
-        type: 'Плейлист',
-        title: widget.playlist.title,
-        coverUrl: widget.playlist.coverUrl,
-        titleTrailing: AppContextMenu<String>(
-          onSelected: (value) async {
-            switch (value) {
-              case 'rename':
-                await _showRenameDialog(context, widget.playlist);
-              case 'visibility':
-                await setPlaylistVisibilityAction(
-                  widget.playlist.kind,
-                  isPublic: !widget.playlist.isPublic,
-                );
-                widget.refresh();
-              case 'delete':
-                await _showDeleteConfirm(context, widget.playlist);
-            }
-          },
-          items: [
-            const AppContextMenuItem(
-              value: 'rename',
-              label: 'Переименовать',
-              icon: Icons.edit_rounded,
-            ),
-            AppContextMenuItem(
-              value: 'visibility',
-              label: widget.playlist.isPublic
-                  ? 'Сделать приватным'
-                  : 'Сделать публичным',
-              icon: widget.playlist.isPublic
-                  ? Icons.lock_outline_rounded
-                  : Icons.public_rounded,
-            ),
-            AppContextMenuItem(
-              value: 'delete',
-              label: 'Удалить плейлист',
-              icon: Icons.delete_forever_rounded,
-              color: cs.error,
-            ),
+        final account = accountSignal();
+        final owner = owned ? (account?.displayName ?? account?.login ?? 'Вы') : 'Другой пользователь';
+        return CollectionPage(
+          cover: (size) => GCover(url: p.coverUrl, size: size, radius: GRadius.x3l, icon: LucideIcons.listMusic),
+          kindLabel: owned ? 'Мой плейлист' : 'Плейлист',
+          title: p.title,
+          stats: [
+            ('Треков', '${p.trackCount}'),
+            ('Длительность', formatTotalDuration(totalMs)),
+            ('Автор', owner),
           ],
-          child: IconButton(
-            icon: Icon(
-              Icons.more_vert_rounded,
-              color: cs.onSurfaceVariant,
-              size: 32,
-            ),
-            onPressed: null,
-            tooltip: 'Опции плейлиста',
-          ),
-        ),
-        actions: isAndroid
-            ? [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      onPressed: () => PlaybackController.playPlaylist(
-                        widget.playlist.uid.toString(),
-                        widget.playlist.kind,
-                      ),
-                      tooltip: 'Слушать',
-                      icon: const Icon(Icons.play_arrow_rounded),
-                      style: IconButton.styleFrom(
-                        minimumSize: const Size(64, 56),
-                        iconSize: 26,
-                        backgroundColor: cs.onSurface.withValues(alpha: 0.1),
-                        foregroundColor: cs.onSurface,
-                        side: BorderSide(color: cs.outlineVariant),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      onPressed: () => _handleUpload(context),
-                      tooltip: 'Загрузить трек',
-                      icon: const Icon(Icons.upload_rounded),
-                      style: IconButton.styleFrom(
-                        minimumSize: const Size(64, 56),
-                        iconSize: 26,
-                        backgroundColor: cs.onSurface.withValues(alpha: 0.1),
-                        foregroundColor: cs.onSurface,
-                        side: BorderSide(color: cs.outlineVariant),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    DownloadTargetMenu(
-                      compact: true,
-                      isLoading: _isDownloading,
-                      onSelected: (mode) => unawaited(_downloadPlaylist(mode)),
-                    ),
-                  ],
-                ),
-              ]
-            : [
-                M3EButton.icon(
-                  onPressed: () => PlaybackController.playPlaylist(
-                    widget.playlist.uid.toString(),
-                    widget.playlist.kind,
-                  ),
-                  icon: const Icon(Icons.play_arrow_rounded),
-                  label: const Text('Слушать'),
-                  size: M3EButtonSize.md,
-                ),
-                const SizedBox(width: 12),
-                M3EButton.icon(
-                  onPressed: () => _handleUpload(context),
-                  icon: const Icon(Icons.upload_rounded),
-                  label: const Text('Загрузить трек'),
-                  style: M3EButtonStyle.outlined,
-                  size: M3EButtonSize.md,
-                  decoration: M3EButtonDecoration.styleFrom(
-                    backgroundColor: cs.onSurface.withValues(alpha: 0.1),
-                    foregroundColor: cs.onSurface,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                DownloadTargetMenu(
-                  compact: false,
-                  isLoading: _isDownloading,
-                  onSelected: (mode) => unawaited(_downloadPlaylist(mode)),
-                ),
-              ],
-      ),
-      slivers: [
-        SliverToBoxAdapter(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(40, 0, 40, 16),
-            child: TextField(
-              controller: widget.searchController,
-              style: TextStyle(color: cs.onSurface),
-              decoration: InputDecoration(
-                hintText: 'Поиск в плейлисте...',
-                hintStyle: TextStyle(
-                  color: cs.onSurface.withValues(alpha: 0.24),
-                ),
-                prefixIcon: Icon(
-                  Icons.search,
-                  color: cs.onSurface.withValues(alpha: 0.38),
-                ),
-                suffixIcon: widget.searchController.text.isNotEmpty
-                    ? IconButton(
-                        icon: Icon(
-                          Icons.clear,
-                          color: cs.onSurface.withValues(alpha: 0.38),
-                        ),
-                        onPressed: () {
-                          widget.searchController.clear();
-                        },
-                      )
-                    : null,
-                filled: true,
-                fillColor: cs.onSurface.withValues(alpha: 0.05),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.lg),
-                  borderSide: BorderSide.none,
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-              ),
-            ),
-          ),
-        ),
-        if (widget.isLoading)
-          const SliverFillRemaining(
-            hasScrollBody: false,
-            child: Center(child: CommonLoadingWidget()),
-          )
-        else if (_localTracks.isEmpty)
-          SliverFillRemaining(
-            hasScrollBody: false,
-            child: Center(
-              child: Text(
-                'Ничего не найдено',
-                style: TextStyle(
-                  color: cs.onSurface.withValues(alpha: 0.38),
-                ),
-              ),
-            ),
-          )
-        else if (searchActive)
-          SliverM3ESegmentedList(
-            haptic: M3EHapticFeedback.light,
-            itemCount: _localTracks.length,
-            color: Colors.transparent,
-            padding: EdgeInsets.symmetric(
-              horizontal: context.isNarrow ? 0 : 40,
-              vertical: 4,
-            ),
-            itemBuilder: (context, index) {
-              final track = _localTracks[index];
-              return _TrackTile(
-                track: track,
-                index: index,
-                playlist: widget.playlist,
-                onRemove: () async {
-                  final success = await removeTrackFromPlaylistAction(
-                    widget.playlist.kind,
-                    track.id,
-                    track.albumId,
-                  );
-                  if (success) widget.refresh();
-                },
-              );
-            },
-          )
-        else
-          SliverReorderableList(
-            itemBuilder: (context, index) {
-              final track = _localTracks[index];
-              return KeyedSubtree(
-                key: ValueKey('${track.id}_$index'),
-                child: _TrackTile(
-                  track: track,
-                  index: index,
-                  playlist: widget.playlist,
-                  dragEnabled: true,
-                  onRemove: () async {
-                    final success = await removeTrackFromPlaylistAction(
-                      widget.playlist.kind,
-                      track.id,
-                      track.albumId,
-                    );
-                    if (success) widget.refresh();
-                  },
-                ),
-              );
-            },
-            itemCount: _localTracks.length,
-            onReorderItem: (oldIndex, originalNewIndex) async {
-              var newIndex = originalNewIndex;
-              setState(() {
-                if (newIndex > oldIndex) newIndex -= 1;
-                final item = _localTracks.removeAt(oldIndex);
-                _localTracks.insert(newIndex, item);
-              });
-
-              final track = _localTracks[newIndex];
-              final success = await moveTrackInPlaylistAction(
-                widget.playlist.kind,
-                oldIndex,
-                newIndex,
-                track.id,
-                track.albumId,
-              );
-
-              if (!success) {
-                widget.refresh();
-              }
-            },
-          ),
-      ],
-    );
-  }
-
-  Future<void> _showRenameDialog(
-    BuildContext context,
-    PlaylistDetailsDto playlist,
-  ) async {
-    final controller = TextEditingController(text: playlist.title);
-    try {
-      await showDialog<void>(
-        context: context,
-        builder: (context) {
-          final cs = Theme.of(context).colorScheme;
-          return AppDialog(
-            title: 'Переименовать плейлист',
-            content: TextField(
-              controller: controller,
-              autofocus: true,
-              style: TextStyle(color: cs.onSurface),
-              decoration: InputDecoration(
-                filled: true,
-                fillColor: cs.onSurface.withValues(alpha: 0.05),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.sm),
-                  borderSide: BorderSide.none,
-                ),
-              ),
-            ),
-            actions: [
-              AppDialog.cancelButton(context),
-              ElevatedButton(
-                onPressed: () async {
-                  if (controller.text.isNotEmpty) {
-                    await renamePlaylistAction(playlist.kind, controller.text);
-                    widget.refresh();
-                    if (context.mounted) Navigator.pop(context);
-                  }
-                },
-                child: const Text('Сохранить'),
-              ),
-            ],
-          );
-        },
-      );
-    } finally {
-      controller.dispose();
-    }
-  }
-
-  Future<void> _showDeleteConfirm(
-    BuildContext context,
-    PlaylistDetailsDto playlist,
-  ) async {
-    await showDialog<void>(
-      context: context,
-      builder: (context) {
-        final cs = Theme.of(context).colorScheme;
-        return AppDialog(
-          title: 'Удалить плейлист?',
-          content: Text(
-            "Вы уверены, что хотите удалить '${playlist.title}'? Это действие нельзя отменить.",
-            style: TextStyle(color: cs.onSurfaceVariant),
+          primaryAction: ListenButton(
+            onPressed: p.tracks.isEmpty ? null : () => unawaited(PlaybackController.playPlaylist('${p.uid}', p.kind)),
           ),
           actions: [
-            AppDialog.cancelButton(context),
-            ElevatedButton(
+            GCircleButton(
+              icon: LucideIcons.shuffle,
+              size: 48,
+              tooltip: 'Перемешать',
+              active: isShuffledSignal(),
+              onPressed: () => unawaited(PlaybackController.toggleShuffle()),
+            ),
+            if (owned)
+              GCircleButton(
+                icon: LucideIcons.pencil,
+                size: 48,
+                tooltip: 'Переименовать',
+                onPressed: () => unawaited(_rename()),
+              ),
+            GCircleButton(
+              icon: LucideIcons.share,
+              size: 48,
+              tooltip: 'Скопировать ссылку',
               onPressed: () async {
-                await deletePlaylistAction(playlist.kind);
-                if (context.mounted) {
-                  Navigator.pop(context);
-                  setSection(AppSection.liked);
-                }
+                await Clipboard.setData(
+                  ClipboardData(text: 'https://music.yandex.ru/users/${p.uid}/playlists/${p.kind}'),
+                );
+                showAppSuccess('Ссылка скопирована');
               },
-              style: ElevatedButton.styleFrom(backgroundColor: cs.error),
-              child: const Text('Удалить'),
+            ),
+            GMenu(
+              items: () => [
+                GMenuItem(
+                  label: 'Скачать',
+                  icon: LucideIcons.download,
+                  children: downloadCollectionItems(_tracks, 'Плейлист - ${p.title}'),
+                ),
+                if (owned) ...[
+                  GMenuItem(label: 'Загрузить трек', icon: LucideIcons.upload, onSelected: () => unawaited(_upload())),
+                  GMenuItem(
+                    label: p.isPublic ? 'Сделать приватным' : 'Сделать публичным',
+                    icon: p.isPublic ? LucideIcons.lock : LucideIcons.globe,
+                    onSelected: () => unawaited(_toggleVisibility()),
+                  ),
+                  const GMenuItem.divider(),
+                  GMenuItem(
+                    label: 'Удалить плейлист',
+                    icon: LucideIcons.trash2,
+                    destructive: true,
+                    onSelected: () => unawaited(_delete()),
+                  ),
+                ],
+              ],
+              builder: (context, menu) => GCircleButton(
+                icon: LucideIcons.ellipsis,
+                size: 48,
+                tooltip: 'Ещё',
+                onPressed: () => menu.open(),
+              ),
             ),
           ],
-        );
-      },
-    );
-  }
-}
-
-class _TrackTile extends StatelessWidget {
-  final SimpleTrackDto track;
-  final int index;
-  final PlaylistDetailsDto playlist;
-  final VoidCallback onRemove;
-  final bool dragEnabled;
-
-  const _TrackTile({
-    required this.track,
-    required this.index,
-    required this.playlist,
-    required this.onRemove,
-    this.dragEnabled = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final dragIndicator = Icon(
-      Icons.drag_indicator_rounded,
-      color: cs.onSurface.withValues(alpha: 0.38),
-      size: 20,
-    );
-    final dragHandle = dragEnabled
-        ? ReorderableDragStartListener(
-            index: index,
-            child: dragIndicator,
-          )
-        : dragIndicator;
-    return CommonTrackTile(
-      trackId: track.id,
-      title: track.title,
-      version: track.version,
-      artists: track.artists,
-      albumId: track.albumId,
-      leading: SizedBox(
-        width: 84,
-        child: Row(
-          children: [
-            dragHandle,
-            TrackCover(url: track.coverUrl),
+          footer: p.isPublic ? 'Публичный плейлист' : 'Приватный плейлист',
+          slivers: [
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
+                child: GSearchField(
+                  controller: _searchController,
+                  placeholder: 'Поиск в плейлисте',
+                  onChanged: _onSearch,
+                ),
+              ),
+            ),
+            const SliverToBoxAdapter(child: TrackListHeader()),
+            if (_tracks.isEmpty)
+              SliverToBoxAdapter(
+                child: _loading
+                    ? const GLoader()
+                    : GEmptyState(
+                        icon: LucideIcons.listMusic,
+                        title: searching ? 'Ничего не найдено' : 'В плейлисте пока нет треков',
+                        compact: true,
+                      ),
+              )
+            else
+              SliverList.builder(
+                itemCount: _tracks.length,
+                itemBuilder: (context, i) {
+                  final t = _tracks[i];
+                  return TrackRow(
+                    key: ValueKey('pl_${t.id}_$i'),
+                    track: t,
+                    onPlay: () => unawaited(PlaybackController.playPlaylistTrack('${p.uid}', p.kind, t.id)),
+                    menuTrailing: owned
+                        ? [
+                            const GMenuItem.divider(),
+                            if (!searching && i > 0)
+                              GMenuItem(
+                                label: 'Переместить выше',
+                                icon: LucideIcons.arrowUp,
+                                onSelected: () => unawaited(_move(i, i - 1)),
+                              ),
+                            if (!searching && i < _tracks.length - 1)
+                              GMenuItem(
+                                label: 'Переместить ниже',
+                                icon: LucideIcons.arrowDown,
+                                onSelected: () => unawaited(_move(i, i + 1)),
+                              ),
+                            GMenuItem(
+                              label: 'Удалить из плейлиста',
+                              icon: LucideIcons.trash2,
+                              destructive: true,
+                              onSelected: () => unawaited(_remove(t)),
+                            ),
+                          ]
+                        : const [],
+                  );
+                },
+              ),
           ],
-        ),
-      ),
-      trailing: Text(
-        formatDuration(track.durationMs),
-        style: TextStyle(color: cs.onSurface.withValues(alpha: 0.38)),
-      ),
-      hoverActions: [
-        IconButton(
-          icon: Icon(
-            Icons.playlist_remove_rounded,
-            color: cs.error,
-          ),
-          onPressed: onRemove,
-          tooltip: 'Удалить из плейлиста',
-        ),
-      ],
-      onTap: () => PlaybackController.playPlaylistTrack(
-        playlist.uid.toString(),
-        playlist.kind,
-        track.id,
-      ),
-      onTitleTap: () {
-        if (track.albumId != null) {
-          navigateTo(AppSection.album, track.albumId);
-        }
+        );
       },
     );
   }

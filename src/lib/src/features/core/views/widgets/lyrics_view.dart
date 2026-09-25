@@ -1,25 +1,33 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:ui' as ui;
 
-import 'package:m3e_core/m3e_core.dart';
+import 'package:flutter/rendering.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
-// `untracked` comes from the signals core, re-exported here.
-import 'package:signals_core/signals_core.dart' show untracked;
-import 'package:youmuz/src/features/core/views/widgets/common_ui.dart';
 import 'package:youmuz/src/features/playback/providers/lyrics_provider.dart';
 import 'package:youmuz/src/features/playback/providers/playback_provider.dart';
+import 'package:youmuz/src/ui/ui.dart';
 
-/// Shared timing for the active-line transition. Opacity, scale, blur, the
-/// dimming of not-yet-sung words *and* the scroll that brings the line to the
-/// centre all run on this, so nothing arrives out of step with the rest.
-const Duration _lyricTransitionDuration = Duration(milliseconds: 600);
+/// Shared timing for the active-line transition. Colour, opacity *and* the
+/// scroll that brings the line to its anchor all run on this, so nothing
+/// arrives out of step with the rest.
+const Duration _lyricTransitionDuration = Duration(milliseconds: 500);
 const Curve _lyricTransitionCurve = Curves.easeOutCubic;
 
 /// Karaoke word highlighting has to keep up with the singing, so it gets its
 /// own short duration rather than [_lyricTransitionDuration].
 const Duration _karaokeWordDuration = Duration(milliseconds: 150);
+
+/// Where the active line settles, as a fraction of the viewport height.
+const double _activeLineAnchor = 0.38;
+
+/// Hovered (seekable) inactive line: `mutedForeground` lerped 55% towards
+/// `foreground`.
+const Color _lyricHoverColor = Color(0xFFC0BEB8);
+
+/// Opacity once the last line is over and a long outro remains
+/// ([hideLyricsOverlaySignal]). The lyrics sit on an opaque panel, so they
+/// recede rather than vanish and stay tappable for seeking back.
+const double _finishedOpacity = 0.35;
 
 /// First index in [lines] whose time is past [currentMs], or `lines.length`
 /// if none. `lines` is time-sorted, so this binary-searches instead of
@@ -38,25 +46,28 @@ int _upperBoundByTime(List<LyricItem> lines, int currentMs) {
   return lo;
 }
 
-/// Shared type treatment for lyric text (plain and karaoke word rendering),
-/// which differ only in color, weight, and an optional highlight glow.
-TextStyle _lyricTextStyle({
-  required Color color,
-  required FontWeight fontWeight,
-  Shadow? glow,
-}) {
-  return TextStyle(
-    color: color,
-    fontSize: Platform.isAndroid ? 32 : 48,
-    fontWeight: fontWeight,
-    letterSpacing: -2.2,
-    height: 1.1,
-    shadows: [
-      ?glow,
-      const Shadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4)),
-    ],
-  );
+/// Every line shares one size and weight, so activating a line only changes
+/// its colour and never reflows the column mid-scroll.
+TextStyle _lyricTextStyle(double size, Color color) => GText.style(
+  size,
+  lineHeight: size * 1.22,
+  weight: GText.semibold,
+  color: color,
+  tight: true,
+);
+
+/// Opacity of a line [offset] rows away from the active one (negative: already
+/// sung). Upcoming lines stay readable and fade with distance; sung ones recede.
+double _lineOpacity(int offset) {
+  if (offset == 0) return 1;
+  if (offset < 0) return 0.45;
+  return (1.05 - offset * 0.15).clamp(0.4, 0.9);
 }
+
+/// Keeps a [GLoader]/[GEmptyState], which centre in all the space they get,
+/// at its natural height inside a dialog.
+Widget _dialogFit(Widget child) =>
+    Column(mainAxisSize: MainAxisSize.min, children: [child]);
 
 class LyricsWidget extends StatefulWidget {
   final String trackId;
@@ -73,6 +84,10 @@ class _LyricsWidgetState extends State<LyricsWidget> {
   final FlutterSignal<bool> _visibleSignal = signal<bool>(false);
 
   bool _initialScrollDone = false;
+
+  /// One key per row of [_keyedLines], used to find the active row's layout.
+  List<GlobalKey> _rowKeys = const [];
+  List<LyricItem>? _keyedLines;
 
   EffectCleanup? _loadingTrackingCleanup;
   EffectCleanup? _progressSubscriptionCleanup;
@@ -187,26 +202,44 @@ class _LyricsWidgetState extends State<LyricsWidget> {
     super.dispose();
   }
 
-  double get _rowHeight => Platform.isAndroid ? 60.0 : 110.0;
+  List<GlobalKey> _keysFor(List<LyricItem> lines) {
+    if (!identical(lines, _keyedLines)) {
+      _keyedLines = lines;
+      _rowKeys = List.generate(lines.length, (_) => GlobalKey());
+    }
+    return _rowKeys;
+  }
 
+  /// Brings row [index] to [_activeLineAnchor]. Rows wrap to any height, so
+  /// the offset comes from the row's own layout; asking only this viewport
+  /// (not `Scrollable.ensureVisible`) keeps enclosing scroll views still.
   void _scrollToIndex(int index) {
-    if (_scrollController.hasClients) {
-      final targetScroll = index * _rowHeight;
+    if (!mounted || !_scrollController.hasClients) return;
+    if (index < 0 || index >= _rowKeys.length) return;
+    final row = _rowKeys[index].currentContext?.findRenderObject();
+    if (row == null || !row.attached) return;
+    final viewport = RenderAbstractViewport.maybeOf(row);
+    if (viewport == null) return;
 
-      if (!_initialScrollDone) {
-        _initialScrollDone = true;
-        _scrollController.jumpTo(targetScroll);
-      } else {
-        // Same timing as the rows themselves, and an ease-*out* curve on
-        // purpose: lines can follow each other faster than the animation
-        // lasts, and a new `animateTo` restarts from zero velocity — with an
-        // ease-in the scroll would visibly stall at every such hand-off.
-        _scrollController.animateTo(
-          targetScroll,
-          duration: _lyricTransitionDuration,
-          curve: _lyricTransitionCurve,
-        );
-      }
+    final position = _scrollController.position;
+    final target = viewport
+        .getOffsetToReveal(row, _activeLineAnchor)
+        .offset
+        .clamp(position.minScrollExtent, position.maxScrollExtent);
+
+    if (!_initialScrollDone) {
+      _initialScrollDone = true;
+      _scrollController.jumpTo(target);
+    } else if ((position.pixels - target).abs() > 0.5) {
+      // Same timing as the rows themselves, and an ease-*out* curve on
+      // purpose: lines can follow each other faster than the animation
+      // lasts, and a new `animateTo` restarts from zero velocity — with an
+      // ease-in the scroll would visibly stall at every such hand-off.
+      _scrollController.animateTo(
+        target,
+        duration: _lyricTransitionDuration,
+        curve: _lyricTransitionCurve,
+      );
     }
   }
 
@@ -220,285 +253,198 @@ class _LyricsWidgetState extends State<LyricsWidget> {
         final hideOverlay = hideLyricsOverlaySignal.value;
 
         return AnimatedOpacity(
-          duration: const Duration(milliseconds: 600),
-          opacity: hideOverlay ? 0.0 : 1.0,
+          duration: _lyricTransitionDuration,
+          curve: _lyricTransitionCurve,
+          opacity: hideOverlay ? _finishedOpacity : 1.0,
           child: lyricsAsync.map(
-            data: (result) {
-              final lines = result.items;
-              if (lines.isEmpty) return const SizedBox.shrink();
+            data: (result) => result.items.isEmpty
+                ? const GEmptyState(
+                    icon: LucideIcons.micVocal,
+                    title: 'Текст отсутствует',
+                    message: 'Для этого трека текст не найден',
+                  )
+                : _buildLyrics(result),
+            loading: () => const GLoader(),
+            error: (Object e, _) => GEmptyState(
+              icon: LucideIcons.circleAlert,
+              title: 'Не удалось загрузить текст',
+              message: e.toString(),
+            ),
+          ),
+        );
+      },
+    );
+  }
 
-              return Stack(
-                children: [
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      final viewportHeight = constraints.maxHeight;
+  Widget _buildLyrics(LyricsResult result) {
+    final lines = result.items;
+    final keys = _keysFor(lines);
 
-                      return SignalBuilder(
-                        builder: (context) {
-                          final activeIndex = _activeIndexSignal.value;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final viewportHeight = constraints.maxHeight;
+              final fontSize = constraints.maxWidth < 560 ? 24.0 : 30.0;
 
-                          if (activeIndex != -1) {
-                            WidgetsBinding.instance.addPostFrameCallback((_) {
-                              _scrollToIndex(activeIndex);
-                            });
-                          }
+              return SignalBuilder(
+                builder: (context) {
+                  final activeIndex = _activeIndexSignal.value;
 
-                          return ShaderMask(
-                            shaderCallback: (rect) => const LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                Colors.transparent,
-                                Colors.white,
-                                Colors.white,
-                                Colors.transparent,
-                              ],
-                              stops: [0.0, 0.25, 0.75, 1.0],
-                            ).createShader(rect),
-                            blendMode: BlendMode.dstIn,
-                            child: ScrollConfiguration(
-                              behavior: ScrollConfiguration.of(
-                                context,
-                              ).copyWith(scrollbars: false),
-                              child: ListView.builder(
-                                controller: _scrollController,
-                                physics: const NeverScrollableScrollPhysics(),
-                                itemCount: lines.length,
-                                padding: EdgeInsets.only(
-                                  top: (viewportHeight / 2) - (_rowHeight / 2),
-                                  bottom: viewportHeight / 2,
-                                ),
-                                itemExtent: _rowHeight,
-                                itemBuilder: (context, index) {
-                                  final item = lines[index];
-                                  final isActive = index == activeIndex;
-                                  final distance = (index - activeIndex).abs();
+                  if (activeIndex != -1) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      _scrollToIndex(activeIndex);
+                    });
+                  }
 
-                                  return _LyricRow(
-                                    key: ValueKey('${widget.trackId}_$index'),
-                                    item: item,
-                                    isActive: isActive,
-                                    distance: distance,
-                                  );
-                                },
+                  // Only a short fade at the very edges, so lines leaving the
+                  // viewport are not cut off hard.
+                  return ShaderMask(
+                    shaderCallback: (rect) => const LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Color(0x00000000),
+                        Color(0xFF000000),
+                        Color(0xFF000000),
+                        Color(0x00000000),
+                      ],
+                      stops: [0.0, 0.06, 0.94, 1.0],
+                    ).createShader(rect),
+                    blendMode: BlendMode.dstIn,
+                    child: ScrollConfiguration(
+                      behavior: ScrollConfiguration.of(
+                        context,
+                      ).copyWith(scrollbars: false),
+                      child: SingleChildScrollView(
+                        controller: _scrollController,
+                        physics: const NeverScrollableScrollPhysics(),
+                        padding: EdgeInsets.only(
+                          top: viewportHeight * _activeLineAnchor,
+                          bottom: viewportHeight * (1 - _activeLineAnchor),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            for (var i = 0; i < lines.length; i++)
+                              _LyricRow(
+                                key: keys[i],
+                                item: lines[i],
+                                isActive: i == activeIndex,
+                                offset: i - activeIndex,
+                                fontSize: fontSize,
                               ),
-                            ),
-                          );
-                        },
-                      );
-                    },
-                  ),
-                  if (result.providerName.isNotEmpty)
-                    Align(
-                      alignment: Alignment.topCenter,
-                      child: _LyricsSourceLabel(
-                        key: ValueKey('${widget.trackId}_source'),
-                        providerName: result.providerName,
+                          ],
+                        ),
                       ),
                     ),
-                ],
+                  );
+                },
               );
             },
-            loading: () => const _LyricsLoadingIndicator(),
-            error: (Object e, _) => CommonErrorWidget(error: e.toString()),
-          ),
-        );
-      },
-    );
-  }
-}
-
-/// M3-Expressive loading state for the lyrics panel: the real Android M3
-/// `LoadingIndicator` (ported by `m3e_core`), which morphs between
-/// `RoundedPolygon` shapes with spring physics — near the top of the screen
-/// instead of a centered spinner, shown while the text is being fetched (no
-/// dark scrim behind it — see [lyricsSuppressDimSignal] in `layout.dart`).
-class _LyricsLoadingIndicator extends StatelessWidget {
-  const _LyricsLoadingIndicator();
-
-  @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.topCenter,
-      child: Padding(
-        padding: const EdgeInsets.only(top: 32),
-        child: M3ELoadingIndicator(
-          color: Theme.of(context).colorScheme.primary,
-        ),
-      ),
-    );
-  }
-}
-
-/// Shows the lyrics source above the text for a couple seconds, then fades
-/// out and stays hidden. Keyed by track id so it re-appears for each new
-/// track's lyrics.
-class _LyricsSourceLabel extends StatefulWidget {
-  final String providerName;
-
-  const _LyricsSourceLabel({required this.providerName, super.key});
-
-  @override
-  State<_LyricsSourceLabel> createState() => _LyricsSourceLabelState();
-}
-
-class _LyricsSourceLabelState extends State<_LyricsSourceLabel> {
-  bool _visible = true;
-
-  @override
-  void initState() {
-    super.initState();
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) setState(() => _visible = false);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 8),
-      child: AnimatedOpacity(
-        duration: const Duration(milliseconds: 600),
-        opacity: _visible ? 1.0 : 0.0,
-        child: Text(
-          widget.providerName,
-          style: TextStyle(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-            fontSize: 20,
-            fontWeight: FontWeight.w600,
-            letterSpacing: 0.2,
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// [ImageFiltered] with an animated blur sigma. `ImageFilter.blur` is a plain
-/// value, so changing it rebuilds with the new radius instantly — this tweens
-/// the sigma over [_lyricTransitionDuration] instead. The filter (and its
-/// `saveLayer`) is skipped entirely once the blur is effectively zero.
-class _AnimatedBlur extends StatelessWidget {
-  final double sigma;
-  final Widget child;
-
-  const _AnimatedBlur({required this.sigma, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(end: sigma),
-      duration: _lyricTransitionDuration,
-      curve: _lyricTransitionCurve,
-      child: child,
-      builder: (context, value, child) {
-        if (value < 0.05) return child!;
-        return ImageFiltered(
-          imageFilter: ui.ImageFilter.blur(
-            sigmaX: value,
-            sigmaY: value,
-            tileMode: TileMode.decal,
+        if (result.providerName.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Text(
+              'Источник: ${result.providerName}',
+              style: GText.xs(color: GColors.mutedForeground),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
-          child: child,
-        );
-      },
+        ],
+      ],
     );
   }
 }
 
-class _LyricRow extends StatelessWidget {
+/// One synced line: tap seeks to its start.
+class _LyricRow extends StatefulWidget {
   final LyricItem item;
   final bool isActive;
-  final int distance;
+
+  /// Rows from the active one; negative for lines already sung.
+  final int offset;
+  final double fontSize;
 
   const _LyricRow({
     required this.item,
     required this.isActive,
-    required this.distance,
+    required this.offset,
+    required this.fontSize,
     super.key,
   });
 
   @override
+  State<_LyricRow> createState() => _LyricRowState();
+}
+
+// Hover is tracked here rather than through `GPressable`: that one only
+// reports hover while focusable, and a tab stop per lyric line would bury
+// the rest of the page.
+class _LyricRowState extends State<_LyricRow> {
+  bool _hovered = false;
+
+  void _setHovered(bool value) {
+    if (_hovered != value) setState(() => _hovered = value);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final onSurface = Theme.of(context).colorScheme.onSurface;
+    final item = widget.item;
+    final isActive = widget.isActive;
+    final fontSize = widget.fontSize;
     if (item is LyricTimer) {
       return _LyricTimerWidget(
-        item: item as LyricTimer,
+        item: item,
         isActive: isActive,
+        height: fontSize * 1.6,
       );
     }
 
     final line = item as LyricLine;
-    var opacity = 1.0;
-    var scale = 1.0;
-    var blur = 0.0;
-
-    if (isActive) {
-      opacity = 1.0;
-      scale = 1.0;
-      blur = 0.0;
-    } else {
-      if (distance == 1) {
-        opacity = 0.4;
-        scale = 0.94;
-        blur = 1.0;
-      } else if (distance == 2) {
-        opacity = 0.15;
-        scale = 0.9;
-        blur = 2.0;
-      } else {
-        // No blur beyond distance 2: at 0.05 opacity the row is barely
-        // visible anyway, so skip the extra `ImageFiltered` saveLayer —
-        // rows this far out are usually the majority of what's on screen,
-        // and each one stacks another offscreen pass during the transition.
-        opacity = 0.05;
-        scale = 0.86;
-        blur = 0.0;
-      }
-    }
+    final hovered = _hovered && !isActive;
+    final color = isActive
+        ? GColors.foreground
+        : (hovered ? _lyricHoverColor : GColors.mutedForeground);
+    final style = _lyricTextStyle(fontSize, color);
+    // Hover reacts at the UI pace; the line hand-off stays on the slower
+    // shared timing.
+    final duration = hovered ? GDurations.fast : _lyricTransitionDuration;
 
     return RepaintBoundary(
-      child: Center(
-        child: Container(
-          width: double.infinity,
-          padding: EdgeInsets.symmetric(
-            horizontal: Platform.isAndroid ? 16 : 48,
-          ),
-          alignment: Alignment.center,
-          child: AnimatedScale(
-            duration: _lyricTransitionDuration,
-            curve: _lyricTransitionCurve,
-            scale: scale,
-            child: AnimatedOpacity(
-              duration: _lyricTransitionDuration,
-              curve: _lyricTransitionCurve,
-              opacity: opacity,
-              child: _AnimatedBlur(
-                sigma: blur,
-                // Word-synced lines use the karaoke layout whether or not they
-                // are active. Swapping layouts on activation moved every word
-                // and rescaled the `FittedBox` in a single frame; keeping one
-                // layout means activating a line changes colour only.
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => _setHovered(true),
+        onExit: (_) => _setHovered(false),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => unawaited(PlaybackController.seekTo(line.time)),
+          child: Semantics(
+            button: true,
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: fontSize * 0.27),
+              child: AnimatedOpacity(
+                duration: duration,
+                curve: _lyricTransitionCurve,
+                opacity: hovered ? 1.0 : _lineOpacity(widget.offset),
+                // Word-synced lines use the karaoke layout whether or not
+                // they are active, so activating a line changes colour only.
                 child: (line.words?.isNotEmpty ?? false)
-                    ? _KaraokeLineText(line: line, isActive: isActive)
-                    : FittedBox(
-                        fit: BoxFit.scaleDown,
-                        child: Text(
-                          line.text,
-                          textAlign: TextAlign.center,
-                          style: _lyricTextStyle(
-                            color: onSurface,
-                            fontWeight: isActive
-                                ? FontWeight.w900
-                                : FontWeight.w800,
-                            glow: isActive
-                                ? Shadow(
-                                    color: onSurface.withValues(alpha: 0.3),
-                                    blurRadius: 20,
-                                  )
-                                : null,
-                          ),
-                        ),
+                    ? _KaraokeLineText(
+                        line: line,
+                        isActive: isActive,
+                        style: style,
+                      )
+                    : AnimatedDefaultTextStyle(
+                        duration: duration,
+                        curve: _lyricTransitionCurve,
+                        style: style,
+                        child: Text(line.text),
                       ),
               ),
             ),
@@ -514,12 +460,17 @@ class _LyricRow extends StatelessWidget {
 /// supply word-synced timing (currently BetterLyrics).
 ///
 /// Inactive lines are laid out exactly the same way — they just render every
-/// word plain, and let the row's own opacity/blur do the dimming.
+/// word in the row colour, and let the row's own opacity do the dimming.
 class _KaraokeLineText extends StatelessWidget {
   final LyricLine line;
   final bool isActive;
+  final TextStyle style;
 
-  const _KaraokeLineText({required this.line, required this.isActive});
+  const _KaraokeLineText({
+    required this.line,
+    required this.isActive,
+    required this.style,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -527,7 +478,12 @@ class _KaraokeLineText extends StatelessWidget {
     // visible row to `trackProgressSignal` would rebuild the whole viewport
     // eight times a second for highlighting that isn't even shown.
     if (!isActive) {
-      return _KaraokeLine(words: line.words!, currentMs: 0, lineActive: false);
+      return _KaraokeLine(
+        words: line.words!,
+        currentMs: 0,
+        lineActive: false,
+        style: style,
+      );
     }
 
     return SignalBuilder(
@@ -535,6 +491,7 @@ class _KaraokeLineText extends StatelessWidget {
         words: line.words!,
         currentMs: trackProgressSignal.value.positionMs.toInt(),
         lineActive: true,
+        style: style,
       ),
     );
   }
@@ -571,11 +528,13 @@ class _KaraokeLine extends StatefulWidget {
   final List<LyricWord> words;
   final int currentMs;
   final bool lineActive;
+  final TextStyle style;
 
   const _KaraokeLine({
     required this.words,
     required this.currentMs,
     required this.lineActive,
+    required this.style,
   });
 
   @override
@@ -583,7 +542,13 @@ class _KaraokeLine extends StatefulWidget {
 }
 
 class _KaraokeLineState extends State<_KaraokeLine> {
-  ({int sungCount, int singingIndex, bool lineActive, int wordsId})?
+  ({
+    int sungCount,
+    int singingIndex,
+    bool lineActive,
+    int wordsId,
+    TextStyle style,
+  })?
   _lastSignature;
   Widget? _lastBuilt;
 
@@ -591,10 +556,9 @@ class _KaraokeLineState extends State<_KaraokeLine> {
   void didUpdateWidget(_KaraokeLine oldWidget) {
     super.didUpdateWidget(oldWidget);
     // A different lyrics source for the same track yields new `LyricWord`
-    // objects with (possibly) identical timings. The row's key is
-    // `'${trackId}_$index'`, so the element is reused and an unchanged
-    // signature would keep serving the PREVIOUS provider's text until a word
-    // boundary happened to invalidate the cache.
+    // objects with (possibly) identical timings. An unchanged signature
+    // would keep serving the PREVIOUS provider's text until a word boundary
+    // happened to invalidate the cache.
     if (!identical(oldWidget.words, widget.words)) {
       _lastSignature = null;
       _lastBuilt = null;
@@ -609,6 +573,7 @@ class _KaraokeLineState extends State<_KaraokeLine> {
       singingIndex: wordSignature.singingIndex,
       lineActive: widget.lineActive,
       wordsId: identityHashCode(widget.words),
+      style: widget.style,
     );
     final cached = _lastBuilt;
     if (cached != null && signature == _lastSignature) {
@@ -616,23 +581,18 @@ class _KaraokeLineState extends State<_KaraokeLine> {
     }
     _lastSignature = signature;
 
-    final built = FittedBox(
-      fit: BoxFit.scaleDown,
-      child: Wrap(
-        alignment: WrapAlignment.center,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
-          for (final word in widget.words)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 3),
-              child: _KaraokeWordText(
-                word: word,
-                currentMs: widget.currentMs,
-                lineActive: widget.lineActive,
-              ),
-            ),
-        ],
-      ),
+    // Words arrive trimmed, so the gap is the space between them.
+    final built = Wrap(
+      spacing: (widget.style.fontSize ?? 30) * 0.24,
+      children: [
+        for (final word in widget.words)
+          _KaraokeWordText(
+            word: word,
+            currentMs: widget.currentMs,
+            lineActive: widget.lineActive,
+            style: widget.style,
+          ),
+      ],
     );
     _lastBuilt = built;
     return built;
@@ -643,16 +603,17 @@ class _KaraokeWordText extends StatelessWidget {
   final LyricWord word;
   final int currentMs;
   final bool lineActive;
+  final TextStyle style;
 
   const _KaraokeWordText({
     required this.word,
     required this.currentMs,
     required this.lineActive,
+    required this.style,
   });
 
   @override
   Widget build(BuildContext context) {
-    final onSurface = Theme.of(context).colorScheme.onSurface;
     final sung = lineActive && currentMs >= word.end.inMilliseconds;
     final singing =
         lineActive &&
@@ -661,6 +622,9 @@ class _KaraokeWordText extends StatelessWidget {
         currentMs < word.end.inMilliseconds;
     // Dimmed only while its line is active and the word has not been reached.
     final pending = lineActive && !sung && !singing;
+    final color = !lineActive
+        ? style.color
+        : (pending ? GColors.mutedForeground : GColors.foreground);
 
     return AnimatedDefaultTextStyle(
       // Two different transitions share this widget: not-yet-sung words dim
@@ -669,26 +633,24 @@ class _KaraokeWordText extends StatelessWidget {
       // to land on the beat.
       duration: pending ? _lyricTransitionDuration : _karaokeWordDuration,
       curve: pending ? _lyricTransitionCurve : Curves.linear,
-      style: _lyricTextStyle(
-        color: pending ? onSurface.withValues(alpha: 0.3) : onSurface,
-        fontWeight: FontWeight.w900,
-        glow: singing
-            ? Shadow(
-                color: onSurface.withValues(alpha: 0.5),
-                blurRadius: 24,
-              )
-            : null,
-      ),
+      style: style.copyWith(color: color),
       child: Text(word.text),
     );
   }
 }
 
+/// Instrumental break: an empty gap that counts down with three dots during
+/// its last five seconds.
 class _LyricTimerWidget extends StatefulWidget {
   final LyricTimer item;
   final bool isActive;
+  final double height;
 
-  const _LyricTimerWidget({required this.item, required this.isActive});
+  const _LyricTimerWidget({
+    required this.item,
+    required this.isActive,
+    required this.height,
+  });
 
   @override
   State<_LyricTimerWidget> createState() => _LyricTimerWidgetState();
@@ -696,16 +658,30 @@ class _LyricTimerWidget extends StatefulWidget {
 
 class _LyricTimerWidgetState extends State<_LyricTimerWidget>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _pulseController;
+  late final AnimationController _pulseController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1000),
+  );
 
   @override
   void initState() {
     super.initState();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1000),
-    );
-    _pulseController.repeat(reverse: true);
+    _syncPulse();
+  }
+
+  @override
+  void didUpdateWidget(_LyricTimerWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive != oldWidget.isActive) _syncPulse();
+  }
+
+  /// Only the active break can show its dots, so only it keeps a ticker.
+  void _syncPulse() {
+    if (widget.isActive) {
+      _pulseController.repeat(reverse: true);
+    } else {
+      _pulseController.stop();
+    }
   }
 
   @override
@@ -716,63 +692,54 @@ class _LyricTimerWidgetState extends State<_LyricTimerWidget>
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final cs = Theme.of(context).colorScheme;
-        final progress = trackProgressSignal.value;
-        final currentMs = progress.positionMs.toInt();
-        final remainingMs =
-            (widget.item.time.inMilliseconds +
-                widget.item.duration.inMilliseconds) -
-            currentMs;
-        final showDots =
-            widget.isActive &&
-            remainingMs > 0 &&
-            (remainingMs / 1000).ceil() <= 5;
+    if (!widget.isActive) return SizedBox(height: widget.height);
 
-        if (!showDots) return const SizedBox.shrink();
+    return SizedBox(
+      height: widget.height,
+      child: SignalBuilder(
+        builder: (context) {
+          final progress = trackProgressSignal.value;
+          final currentMs = progress.positionMs.toInt();
+          final remainingMs =
+              (widget.item.time.inMilliseconds +
+                  widget.item.duration.inMilliseconds) -
+              currentMs;
+          final showDots = remainingMs > 0 && (remainingMs / 1000).ceil() <= 5;
 
-        return Center(
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: List.generate(3, (index) {
-              final dotValue = (remainingMs / 1000) - (2 - index);
-              final active = dotValue > 0;
+          if (!showDots) return const SizedBox.shrink();
 
-              return AnimatedBuilder(
-                animation: _pulseController,
-                builder: (context, child) {
-                  final pulse = active
-                      ? (_pulseController.value * 0.15 + 1.0)
-                      : 1.0;
-                  return Transform.scale(
-                    scale: pulse,
-                    child: child,
-                  );
-                },
-                child: Container(
-                  margin: const EdgeInsets.symmetric(horizontal: 12),
-                  width: 14,
-                  height: 14,
-                  decoration: BoxDecoration(
-                    color: cs.onSurface.withValues(alpha: active ? 0.9 : 0.1),
-                    shape: BoxShape.circle,
-                    boxShadow: active
-                        ? [
-                            BoxShadow(
-                              color: cs.onSurface.withValues(alpha: 0.2),
-                              blurRadius: 8,
-                            ),
-                          ]
-                        : null,
+          return Align(
+            alignment: Alignment.centerLeft,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: List.generate(3, (index) {
+                final dotValue = (remainingMs / 1000) - (2 - index);
+                final active = dotValue > 0;
+
+                return AnimatedBuilder(
+                  animation: _pulseController,
+                  builder: (context, child) {
+                    final pulse = active
+                        ? (_pulseController.value * 0.15 + 1.0)
+                        : 1.0;
+                    return Transform.scale(scale: pulse, child: child);
+                  },
+                  child: AnimatedContainer(
+                    duration: GDurations.medium,
+                    margin: const EdgeInsets.only(right: 10),
+                    width: 10,
+                    height: 10,
+                    decoration: BoxDecoration(
+                      color: active ? GColors.foreground : GColors.foreground20,
+                      shape: BoxShape.circle,
+                    ),
                   ),
-                ),
-              );
-            }),
-          ),
-        );
-      },
+                );
+              }),
+            ),
+          );
+        },
+      ),
     );
   }
 }
@@ -789,8 +756,8 @@ class LyricsReaderDialog extends StatefulWidget {
 
   static void show(BuildContext context, String trackId, String title) {
     unawaited(
-      showDialog<void>(
-        context: context,
+      showGDialog<void>(
+        context,
         builder: (context) =>
             LyricsReaderDialog(trackId: trackId, title: title),
       ),
@@ -806,72 +773,82 @@ class _LyricsReaderDialogState extends State<LyricsReaderDialog> {
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        final cs = Theme.of(context).colorScheme;
         final lyricsAsync = lyricsSignal(widget.trackId).value;
-        return AppDialog(
-          surfaceTintColor: Colors.transparent,
-          titleWidget: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  widget.title,
-                  style: TextStyle(
-                    color: cs.onSurface,
-                    fontSize: 26,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: -1,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+        return GDialog(
+          title: widget.title,
+          description: 'Текст песни',
+          width: 560,
+          content: lyricsAsync.map(
+            data: (result) => _LyricsReaderBody(result: result),
+            loading: () => _dialogFit(const GLoader()),
+            error: (Object e, _) => _dialogFit(
+              GEmptyState(
+                icon: LucideIcons.circleAlert,
+                title: 'Не удалось загрузить текст',
+                message: e.toString(),
+                compact: true,
               ),
-              IconButton(
-                icon: Icon(Icons.close, color: cs.onSurfaceVariant),
-                onPressed: () => Navigator.pop(context),
-              ),
-            ],
-          ),
-          content: Container(
-            width: 650,
-            height: 800,
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: lyricsAsync.map(
-              data: (result) {
-                final lines = result.items.whereType<LyricLine>().toList();
-                if (lines.isEmpty) {
-                  return Center(
-                    child: Text(
-                      'Текст отсутствует',
-                      style: TextStyle(
-                        color: cs.onSurface.withValues(alpha: 0.24),
-                        fontSize: 18,
-                      ),
-                    ),
-                  );
-                }
-                return ListView.builder(
-                  itemCount: lines.length,
-                  itemBuilder: (context, index) => Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 18),
-                    child: Text(
-                      lines[index].text,
-                      style: TextStyle(
-                        color: cs.onSurface,
-                        fontSize: 26,
-                        fontWeight: FontWeight.w800,
-                        height: 1.3,
-                        letterSpacing: -0.5,
-                      ),
-                    ),
-                  ),
-                );
-              },
-              loading: () => const CommonLoadingWidget(),
-              error: (Object e, _) => CommonErrorWidget(error: e.toString()),
             ),
           ),
         );
       },
+    );
+  }
+}
+
+/// Plain-text lyrics; instrumental breaks and blank lines become paragraph
+/// gaps.
+class _LyricsReaderBody extends StatelessWidget {
+  final LyricsResult result;
+
+  const _LyricsReaderBody({required this.result});
+
+  @override
+  Widget build(BuildContext context) {
+    final children = <Widget>[];
+    var paragraphBreak = false;
+    for (final item in result.items) {
+      if (item is! LyricLine || item.text.trim().isEmpty) {
+        paragraphBreak = children.isNotEmpty;
+        continue;
+      }
+      if (paragraphBreak) {
+        children.add(const SizedBox(height: 20));
+        paragraphBreak = false;
+      }
+      children.add(
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Text(item.text, style: GText.lg()),
+        ),
+      );
+    }
+
+    if (children.isEmpty) {
+      return _dialogFit(
+        const GEmptyState(
+          icon: LucideIcons.micVocal,
+          title: 'Текст отсутствует',
+          message: 'Для этого трека текст не найден',
+          compact: true,
+        ),
+      );
+    }
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          ...children,
+          if (result.providerName.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            Text(
+              'Источник: ${result.providerName}',
+              style: GText.xs(color: GColors.mutedForeground),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

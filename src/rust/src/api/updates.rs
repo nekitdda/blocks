@@ -72,7 +72,7 @@ pub async fn check_for_updates() -> Option<AppUpdateInfoDto> {
     });
 
     let res = CLIENT
-        .get("https://api.github.com/repos/DarkPlayOff/YouMuz/releases/latest")
+        .get("https://api.github.com/repos/nekitdda/YouMuz/releases/latest")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await

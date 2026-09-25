@@ -23,6 +23,7 @@ const OWN_TABLES: &[&str] = &[
     "cache_metadata",
     "track_metadata",
     "track_metadata_artists",
+    "accounts",
 ];
 
 /// Phase 1 (runs BEFORE our CREATEs): rename foreign tables aside so

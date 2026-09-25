@@ -27,3 +27,10 @@ void setSearchQuery(String query) {
     searchQuerySignal.value = query;
   });
 }
+
+/// Forget the query (and with it the results) of the closed session.
+void clearSearchState() {
+  _searchDebounce?.cancel();
+  _searchDebounce = null;
+  searchQuerySignal.value = '';
+}
