@@ -8,9 +8,14 @@
 use crate::app::init::data_root;
 use crate::db::{AppDatabase, StoredAccount};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use yandex_music::YandexMusicClient;
+use yandex_music::error::ClientError;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The crate's client has no request timeout of its own.
+const TOKEN_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn account_dir_in(root: &Path, uid: u64) -> PathBuf {
     root.join("accounts").join(uid.to_string())
@@ -118,10 +123,25 @@ async fn pick_startup_account(db: &mut AppDatabase) -> Option<StoredAccount> {
 }
 
 /// Returns the uid the token belongs to, or an error if Yandex rejects it.
+/// Use [`is_network_error`] to tell "no connection" apart from a bad token.
 pub async fn validate_token(token: &str) -> Result<u64> {
     let client = YandexMusicClient::builder(token).build()?;
-    let status = client.get_account_status().await?;
+    let status = tokio::time::timeout(TOKEN_CHECK_TIMEOUT, client.get_account_status()).await??;
     status.account.uid.ok_or_else(|| "No user id found".into())
+}
+
+/// True when the request never got an answer from the server (offline, DNS,
+/// refused connection, timeout). HTTP error statuses are not network errors.
+pub fn is_network_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.is::<tokio::time::error::Elapsed>() {
+        return true;
+    }
+    match error.downcast_ref::<ClientError>() {
+        Some(ClientError::RequestError { error }) => {
+            error.is_connect() || error.is_timeout() || error.is_request()
+        }
+        _ => false,
+    }
 }
 
 async fn remove_dir_if_exists(dir: &Path) -> std::io::Result<()> {
@@ -387,5 +407,40 @@ mod tests {
         assert_eq!(device.list_accounts().await.unwrap().len(), 1);
         account.close();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_unanswered_requests_count_as_network_errors() {
+        type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let refused = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        let offline: BoxError = ClientError::RequestError { error: refused }.into();
+        assert!(is_network_error(offline.as_ref()));
+
+        let elapsed = tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let timed_out: BoxError = elapsed.into();
+        assert!(is_network_error(timed_out.as_ref()));
+
+        let rejected: BoxError = ClientError::YandexMusicError {
+            error: yandex_music::error::YandexMusicError {
+                name: "session-expired".into(),
+                message: None,
+            },
+        }
+        .into();
+        assert!(!is_network_error(rejected.as_ref()));
+        let no_uid: BoxError = "No user id found".into();
+        assert!(!is_network_error(no_uid.as_ref()));
     }
 }

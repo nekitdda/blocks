@@ -1,3 +1,3 @@
 mod accounts;
 
-pub use accounts::{AccountStore, validate_token};
+pub use accounts::{AccountStore, is_network_error, validate_token};

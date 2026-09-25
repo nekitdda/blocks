@@ -7,7 +7,7 @@
 
 use crate::api::models::{AppError, SavedStateDto, StoredAccountDto, UserAccountDto};
 use crate::app::{AppContext, initialize_session};
-use crate::auth::{AccountStore, validate_token};
+use crate::auth::{AccountStore, is_network_error, validate_token};
 use crate::http::ApiService;
 use flutter_rust_bridge::frb;
 use std::time::Instant;
@@ -67,9 +67,13 @@ pub async fn list_accounts() -> Vec<StoredAccountDto> {
 /// account that is already listed refreshes its token.
 pub async fn add_account(token: String) -> Result<StoredAccountDto, AppError> {
     let token = token.trim().to_string();
-    let uid = validate_token(&token)
-        .await
-        .map_err(|_| AppError::InvalidToken)?;
+    let uid = validate_token(&token).await.map_err(|e| {
+        if is_network_error(e.as_ref()) {
+            AppError::NetworkError
+        } else {
+            AppError::InvalidToken
+        }
+    })?;
 
     AccountStore::save_token(uid, &token).await?;
 
